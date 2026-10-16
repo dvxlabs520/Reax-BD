@@ -38,11 +38,16 @@ void main() {
       if (e.path.endsWith('.sst')) p.basename(e.path),
   ];
 
-  /// Waits (up to ~2 s) until the table files on disk are exactly the live
-  /// tables, i.e. asynchronous deletion of obsolete tables has finished.
+  /// Waits (up to ~5 s) until background flushes and compactions are done
+  /// and the table files on disk are exactly the live tables, i.e.
+  /// asynchronous deletion of obsolete tables has finished too.
   Future<void> settle(LsmStorageEngine e) async {
-    for (var i = 0; i < 200; i++) {
-      if ((await sstFiles()).length == e.stats.sstableCount) return;
+    for (var i = 0; i < 500; i++) {
+      if (!e.isMaintaining &&
+          e.stats.immutableMemtableCount == 0 &&
+          (await sstFiles()).length == e.stats.sstableCount) {
+        return;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
   }
