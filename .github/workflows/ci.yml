@@ -43,11 +43,13 @@ jobs:
       - name: Test
         run: dart test
 
+      # Before the example's pub get, which regenerates its plugin
+      # registrants on Windows and leaves them modified in git.
+      - name: Check the package can be published
+        run: dart pub publish --dry-run
+
       - name: Analyze the example app
         working-directory: example
         run: |
           flutter pub get
           flutter analyze
-
-      - name: Check the package can be published
-        run: dart pub publish --dry-run
