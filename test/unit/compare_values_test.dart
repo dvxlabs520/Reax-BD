@@ -83,7 +83,12 @@ void main() {
     expect(compareValues(big.toDouble(), big + 1), lessThan(0));
     expect(compareValues('�', '😀'), lessThan(0));
     expect(compareValues('a', 'a\u0000'), lessThan(0));
-    expect(compareValues(double.nan, double.infinity), greaterThan(0));
+    // Where NaN sorts depends on the sign bit of the platform's NaN (set
+    // on x64, clear on arm64); it must only agree with the encoding.
+    expect(
+      compareValues(double.nan, double.infinity).sign,
+      reference(double.nan, double.infinity),
+    );
   });
 
   test('extractFieldValue reads plain and dotted paths', () {
