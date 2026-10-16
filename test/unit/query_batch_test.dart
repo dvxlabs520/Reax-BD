@@ -40,6 +40,8 @@ void main() {
   }
 
   test('update writes every matching document in one batch', () async {
+    final String? skip = skipFaultInjectionInBackground;
+    if (skip != null) return markTestSkipped(skip);
     final int writes = await countWalWrites(() async {
       final int updated = await db.query('items').whereLessThan('n', 10).update(
         <String, dynamic>{'flag': true},
@@ -48,15 +50,17 @@ void main() {
     });
     expect(writes, 1);
     expect(await db.query('items').whereEquals('flag', true).count(), 10);
-  }, skip: skipFaultInjectionInBackground);
+  });
 
   test('delete removes every matching document in one batch', () async {
+    final String? skip = skipFaultInjectionInBackground;
+    if (skip != null) return markTestSkipped(skip);
     final int writes = await countWalWrites(() async {
       expect(await db.query('items').whereEquals('group', 0).delete(), 7);
     });
     expect(writes, 1);
     expect(await db.query('items').count(), 13);
-  }, skip: skipFaultInjectionInBackground);
+  });
 
   test('distinct and groupBy keep large integers apart', () async {
     const int big = 9007199254740992; // 2^53

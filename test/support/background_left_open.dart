@@ -1,5 +1,5 @@
 // Opens a database in the background, writes, and returns from main without
-// closing it. Run by test/unit/background_test.dart, which expects the
+// closing it. Run by test/unit/background_exit_test.dart, which expects the
 // process to exit by itself.
 import 'package:reaxdb_dart/reaxdb_dart.dart';
 

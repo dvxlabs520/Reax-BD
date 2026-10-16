@@ -8,6 +8,8 @@ import 'package:reaxdb_dart/reaxdb_dart.dart';
 import 'package:reaxdb_dart/src/reaxdb.dart' show debugKillBackgroundEngine;
 import 'package:test/test.dart';
 
+import '../support/temp_dir.dart';
+
 void main() {
   late Directory root;
 
@@ -17,7 +19,8 @@ void main() {
 
   tearDown(() async {
     await ReaxDB.closeAll();
-    if (await root.exists()) await root.delete(recursive: true);
+    // A killed engine leaves its files open, which Windows cannot delete.
+    await deleteTempDirectory(root);
   });
 
   String at(String name) => p.join(root.path, name);
@@ -428,7 +431,7 @@ void main() {
       expect(
         <String>[for (final LogEntry e in info.logs) e.message],
         <String>[
-          '[logs] Database opened at ${at('logs')}',
+          '[logs] Database opened at ${p.canonicalize(at('logs'))}',
           '[logs] Database closed',
         ],
       );
@@ -447,16 +450,5 @@ void main() {
       await rekeyed.put('b', 2);
       expect(await rekeyed.keys().toList(), <String>['a', 'b']);
     });
-
-    test('a database left open does not keep the process alive', () async {
-      final ProcessResult result = await Process.run(
-        Platform.resolvedExecutable,
-        <String>['run', 'test/support/background_left_open.dart', at('left')],
-      );
-      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
-      expect('${result.stdout}', contains('done'));
-      final ReaxDB db = await ReaxDB.open(path: at('left'));
-      expect(await db.get<int>('a'), 1);
-    }, timeout: const Timeout(Duration(minutes: 2)));
   });
 }
