@@ -39,8 +39,9 @@ void main() {
     final String path = '${root.path}/db';
 
     // A 256 KiB memtable over ~13 MiB of data means roughly fifty flushes,
-    // enough L0 tables to trigger repeated L0 -> L1 compaction, and enough
-    // total bytes to push L1 past its target and into L2.
+    // enough L0 tables to trigger repeated L0 -> L1 compaction. (Pushing L1
+    // into L2 takes more than its 64 MiB target; the engine-level test in
+    // storage_regression_test.dart does that with small level targets.)
     ReaxDB db = await ReaxDB.open(
       path: path,
       syncMode: SyncMode.none,
@@ -60,11 +61,12 @@ void main() {
       await db.delete(key(i));
     }
 
+    await db.flush();
     final List<int> levels = db.storageStats.levelTableCounts;
     expect(
-      levels.where((int count) => count > 0).length,
-      greaterThanOrEqualTo(2),
-      reason: 'the load did not reach a second level: $levels',
+      levels.length > 1 && levels[1] > 0,
+      isTrue,
+      reason: 'the load was never compacted into L1: $levels',
     );
 
     await db.compact();

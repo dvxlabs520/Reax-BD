@@ -119,7 +119,8 @@ void main() {
           await File(p.join(tablesDir().path, 'MANIFEST.tmp')).exists(),
           isFalse,
         );
-        expect(e.stats.memtableEntries, 50);
+        // Kept in memory, sealed and waiting for a flush that works.
+        expect(e.stats.immutableMemtableCount, 1);
         expect(_s((await e.get(_b(_k('k', 7))))!), 'v7');
         await e.flush();
         expect((await sstFiles()).length, 1);
@@ -134,32 +135,54 @@ void main() {
   });
 
   group('maintenance errors after a durable write', () {
-    test('auto-flush failure does not fail the write; it is reported and '
-        'retried', () async {
+    test('auto-flush failure does not fail the write that triggered it; '
+        'once memory is full, writes fail cleanly and resume later', () async {
       final errors = <Object>[];
       final e = await openEngine(
         memtableSizeBytes: 4 * 1024,
         onMaintenanceError: (err, _) => errors.add(err),
       );
       IoFaults.hook = (op, _, _) => op == IoOp.sstableWrite ? 0 : null;
+      final accepted = <int>[];
+      final rejected = <int>[];
       for (var i = 0; i < 200; i++) {
-        // Must not throw: every write is durable in the WAL.
-        await e.put(_b(_k('k', i)), Uint8List(100));
+        try {
+          await e.put(_b(_k('k', i)), Uint8List(100));
+          accepted.add(i);
+        } on StorageException {
+          rejected.add(i);
+        }
       }
+      // The first memtables fill and seal fine; once the sealed ones that
+      // cannot be flushed reach the limit, writes are refused instead of
+      // growing memory without bound.
+      expect(accepted, isNotEmpty);
+      expect(rejected, isNotEmpty);
+      expect(accepted.last, lessThan(rejected.first));
+      expect(
+        e.stats.immutableMemtableCount,
+        LsmStorageEngine.maxSealedMemtables,
+      );
       expect(errors, isNotEmpty);
       expect(e.lastMaintenanceError, isA<FileSystemException>());
       expect(e.stats.sstableCount, 0);
-      expect(await e.get(_b(_k('k', 150))), isNotNull);
+      expect(await e.get(_b(_k('k', accepted.last))), isNotNull);
       await expectLater(e.flush(), throwsA(isA<FileSystemException>()));
+
       IoFaults.hook = null;
       await e.flush();
       expect(e.lastMaintenanceError, isNull);
-      expect(e.stats.memtableEntries, 0);
+      expect(e.stats.immutableMemtableCount, 0);
+      await e.put(_b('after'), _b('ok'));
       await e.close();
       final reopened = await openEngine();
-      for (var i = 0; i < 200; i++) {
-        expect(await reopened.get(_b(_k('k', i))), isNotNull);
+      for (final i in accepted) {
+        expect(await reopened.get(_b(_k('k', i))), isNotNull, reason: '$i');
       }
+      for (final i in rejected) {
+        expect(await reopened.get(_b(_k('k', i))), isNull, reason: '$i');
+      }
+      expect(_s((await reopened.get(_b('after')))!), 'ok');
       await reopened.close();
     });
 
@@ -176,6 +199,50 @@ void main() {
         await reopened.close();
       }();
     });
+  });
+
+  test('overwrites and deletes stay correct through several levels', () async {
+    // Small targets, so a modest load reaches L2.
+    Future<LsmStorageEngine> open() => LsmStorageEngine.open(
+      directory: dir.path,
+      syncMode: SyncMode.none,
+      memtableSizeBytes: 32 * 1024,
+      l0CompactionTrigger: 2,
+      baseLevelTargetBytes: 128 * 1024,
+      targetTableBytes: 32 * 1024,
+    );
+    var e = await open();
+    final pad = Uint8List(64);
+    String value(int i, int gen) => 'v$i-$gen';
+    for (var i = 0; i < 8000; i++) {
+      await e.put(_b(_k('k', i)), _b(value(i, 0)));
+      await e.put(_b(_k('p', i)), pad);
+    }
+    for (var i = 0; i < 8000; i += 3) {
+      await e.put(_b(_k('k', i)), _b(value(i, 1)));
+    }
+    for (var i = 0; i < 8000; i += 7) {
+      await e.delete(_b(_k('k', i)));
+    }
+    await e.flush();
+    final levels = e.stats.levelTableCounts;
+    expect(
+      levels.length >= 3 && levels[2] > 0,
+      isTrue,
+      reason: 'the load did not reach L2: $levels',
+    );
+    await e.close();
+
+    e = await open();
+    for (var i = 0; i < 8000; i++) {
+      final got = await e.get(_b(_k('k', i)));
+      if (i % 7 == 0) {
+        expect(got, isNull, reason: 'k$i was deleted');
+      } else {
+        expect(_s(got!), value(i, i % 3 == 0 ? 1 : 0), reason: 'k$i');
+      }
+    }
+    await e.close();
   });
 
   group('WAL growth is bounded by walFlushThresholdBytes', () {

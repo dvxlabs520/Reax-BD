@@ -823,13 +823,14 @@ final class WriteAheadLog {
     return _lastSequence;
   }
 
-  /// Appends [entries] with a single durability barrier for the whole batch.
+  /// Appends [entries] with a single durability barrier for the whole batch,
+  /// and returns how many bytes it added to the log.
   ///
   /// Sequence numbers are assigned in list order. If the write fails the
   /// batch throws, none of it is (or later becomes) part of the log, and
   /// the sequence numbers are not consumed.
-  Future<void> appendAll(List<WalEntry> entries) {
-    if (entries.isEmpty) return Future<void>.value();
+  Future<int> appendAll(List<WalEntry> entries) {
+    if (entries.isEmpty) return Future<int>.value(0);
     return _synchronized(() async {
       _ensureOpen();
       final buf = BytesBuilder(copy: false);
@@ -847,6 +848,7 @@ final class WriteAheadLog {
       _lastSequence = seq;
       _bytesSinceCheckpoint += bytes.length;
       await _maybeRotate();
+      return bytes.length;
     });
   }
 
@@ -1104,7 +1106,11 @@ final class WriteAheadLog {
   /// Records that all entries with sequence numbers up to and including
   /// [upToSequence] are durably persisted by the storage layer, then deletes
   /// log files made fully obsolete by that fact.
-  Future<void> checkpoint(int upToSequence) {
+  ///
+  /// [coveredBytes] is how many of the bytes appended since the previous
+  /// checkpoint this one covers; entries appended after [upToSequence] stay
+  /// counted in [bytesSinceCheckpoint]. Null means everything.
+  Future<void> checkpoint(int upToSequence, {int? coveredBytes}) {
     return _synchronized(() async {
       _ensureOpen();
       // Everything pending must be on disk before the files that hold it
@@ -1126,7 +1132,9 @@ final class WriteAheadLog {
       // A checkpoint authorizes file deletion; it must itself be durable.
       await _writeOut(frame, seq, fsync: true);
       _lastSequence = seq;
-      _bytesSinceCheckpoint = 0;
+      _bytesSinceCheckpoint = coveredBytes == null
+          ? 0
+          : (_bytesSinceCheckpoint - coveredBytes).clamp(0, 1 << 62);
 
       final files = await _listFiles();
       for (var i = 0; i + 1 < files.length; i++) {

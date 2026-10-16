@@ -240,16 +240,27 @@ never a read-modify-write of a posting list blob.
 
 ## Storage engine
 
-- Leveled LSM tree. Writes go to the WAL and then an in-memory memtable; a
-  full memtable is flushed inline to an L0 SSTable and the WAL is checkpointed.
+- Leveled LSM tree. Writes go to the WAL and then an in-memory memtable.
+- A full memtable is *sealed*: it becomes read-only and a fresh one takes
+  the writes. Since 2.5.0 the sealed memtable is flushed to an L0 SSTable,
+  and the levels are compacted, in the background, after the write that
+  sealed it has returned. The WAL is checkpointed only after the SSTable and
+  the manifest describing it are on disk, and only up to the last entry of
+  that memtable, so a crash at any point loses nothing.
+- At most two sealed memtables wait for their flush. A write that would add
+  a third waits for the flush. If flushing keeps failing (a full disk, for
+  example), writes fail with `StorageException` instead of growing memory
+  without bound, and resume once a flush succeeds.
 - Each SSTable carries a bloom filter and min/max key fences, so a point read
   skips files that cannot contain the key.
-- `scan` merges the memtable snapshot with every SSTable level, honouring
-  tombstones with newest-wins. It is the single source of truth for iteration.
-- `StorageStats.immutableMemtableCount` is always 0: flushes are inline, so
-  there is never a sealed-but-unflushed memtable.
-- `flush()` persists the memtable and checkpoints the WAL. `compact()` flushes
-  and then compacts every level until size targets are met.
+- Reads look in the active memtable, then the sealed ones from newest to
+  oldest, then the levels. `scan` merges all of them, honouring tombstones
+  with newest-wins. It is the single source of truth for iteration.
+- `StorageStats.immutableMemtableCount` is the number of sealed memtables
+  waiting for their flush.
+- `flush()` waits for background work, then persists every memtable and
+  checkpoints the WAL. `compact()` flushes and then compacts every level until
+  size targets are met. `close()` waits for background work too.
 
 Both `flush()` and `compact()` are serialized against the export snapshot and
 the write pipeline, so a snapshot scan can never race a compaction that
@@ -282,13 +293,14 @@ final db = await ReaxDB.open(path: '/data/app', keepInMemory: true);
 final user = db.getSync<Map<String, dynamic>>('user:1'); // no await
 ```
 
-Added in 2.5.0. With `keepInMemory: true` the database keeps a decoded copy
-of every entry in memory, like a Hive box:
+Added in 2.5.0. With `keepInMemory: true` the database keeps every entry in
+memory, like a Hive box. Each value is decoded the first time it is read and
+stays decoded:
 
 - **Reads come from memory.** `get`, `getSync`, `getBatch`, `exists`,
   `scan`, `scanPrefix`, `keys`, `range`, `info` and queries never touch the
-  disk and never decode. The record cache is not used, so `cacheStats`
-  stays at zero.
+  disk, and decode a value only the first time it is read. The record cache
+  is not used, so `cacheStats` stays at zero.
 - **Writes are unchanged.** Each write goes to the write-ahead log first,
   with the same durability as without this option. Memory is updated after
   the durability point, in the same pipeline step as the cache would be, so
@@ -310,9 +322,10 @@ of every entry in memory, like a Hive box:
 
 The costs:
 
-- **Opening reads and decodes every entry**, so it takes time in
-  proportion to the data. See [BENCHMARKS.md](BENCHMARKS.md) for measured
-  open times.
+- **Opening reads and decrypts every entry**, so it takes time in
+  proportion to the data. Decoding waits for the first read of each value,
+  so the first query over everything is slower than the next ones. See
+  [BENCHMARKS.md](BENCHMARKS.md) for measured times.
 - **Memory grows with the data**: roughly the size of the decoded values,
   plus a key and two references per entry. Measure your own data before
   using this on large databases on a phone.
