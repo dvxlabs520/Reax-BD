@@ -27,6 +27,7 @@ dependencies:
 dev_dependencies:
   test: ^1.31.0
   lints: ^6.0.0
+  hive_ce: ^2.22.0
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec

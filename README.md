@@ -67,8 +67,7 @@ macOS, Windows, Linux and the Dart VM. It does not run on the web.
 ## ReaxDB or Hive?
 
 Both are pure Dart. This table compares documented features, with
-`hive_ce` 2.22.0 (October 2026). It does not compare speed: see
-[BENCHMARKS.md](BENCHMARKS.md) for ReaxDB's measured numbers.
+`hive_ce` 2.22.0 (October 2026).
 
 | | ReaxDB | Hive (`hive_ce`) |
 | --- | --- | --- |
@@ -78,13 +77,23 @@ Both are pure Dart. This table compares documented features, with
 | Encryption | AES-256-GCM (authenticated) | AES-256-CBC |
 | Entries that expire (TTL) | Yes | No |
 | Typed objects | `toJson`/`fromJson`, no code generation | `TypeAdapter`s, usually generated |
-| Reads | Cached in memory, data on disk | Normal boxes keep every value in memory |
+| Reads | Cached, data on disk; or every value in memory with `keepInMemory: true` (2.5.0) | Normal boxes keep every value in memory |
 | Background isolate | No | Yes (`IsolatedHive`) |
 | Web | No | Yes (IndexedDB) |
 
-Choose Hive if you need the web, or a small box where every value lives in
-memory. Choose ReaxDB if losing a write is not acceptable, or if you need
-queries, transactions or expiry.
+Speed, measured on the same machine with 100,000 documents (details and
+smaller sizes in [BENCHMARKS.md](BENCHMARKS.md#reaxdb-and-hive)):
+
+| | ReaxDB | ReaxDB, `keepInMemory` | Hive |
+| --- | ---: | ---: | ---: |
+| Durable write | 16.9k/s | 17.6k/s | 22.7k/s (`put` + `flush`) |
+| Read | 29.5k/s | 1.03M/s | 0.73M/s |
+| Open | 11 ms | 388 ms | 263 ms |
+| Query, 20,000 results | 653 ms | 29 ms | 5.4 ms (`values.where`) |
+
+Choose Hive if you need the web, or the fastest possible iteration over
+everything you store. Choose ReaxDB if losing a write is not acceptable, or
+if you need queries, transactions or expiry.
 
 ## Common tasks
 
@@ -228,6 +237,21 @@ final db = await ReaxDB.open(
   },
 );
 ```
+
+### Keep everything in memory (2.5.0)
+
+For data that fits in memory and is read far more than it is written, keep
+every value decoded in memory, like a Hive box:
+
+```dart
+final db = await ReaxDB.open(path: '/absolute/path/to/data', keepInMemory: true);
+
+final theme = db.getSync<String>('settings:theme'); // no await, e.g. in build()
+```
+
+Reads and queries then never touch the disk. Writes are still saved to disk
+first, exactly as before. Opening takes longer, because it loads everything.
+See [ADVANCED.md](ADVANCED.md#keeping-every-value-in-memory).
 
 ### Faster writes when you can afford to lose the last ones
 

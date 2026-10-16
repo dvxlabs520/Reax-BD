@@ -60,12 +60,77 @@ scenario, made after the last change to the query path.
 `benchmark/README.md` documents every flag and scenario if you want to
 reproduce or vary this.
 
-## No cross-database comparison was run
+## ReaxDB and Hive
 
-**ReaxDB has not been benchmarked against Hive, Isar, sqflite, SQLite, ObjectBox
-or anything else.** If you need to know how ReaxDB compares with another
-database for your workload, benchmark both on your hardware; this harness is a
-reasonable starting point for the ReaxDB half.
+Measured on 16 October 2026, on the same machine as everything else on this
+page, with [`benchmark/hive_comparison.dart`](benchmark/hive_comparison.dart)
+built AOT, against `hive_ce` 2.22.0. Both databases store the same documents
+(`{id, name, category, score, active, payload}` with a 200-byte payload).
+Every scenario ran three times on a fresh database, and the median
+repetition is reported. The ReaxDB numbers are from the 2.5.0 development
+branch, which adds `keepInMemory`.
+
+```bash
+dart compile exe benchmark/hive_comparison.dart -o hive_comparison
+./hive_comparison --sizes=1000,10000,100000 --runs=3
+```
+
+"Durable" means the write is on disk (fsync) before the call returns:
+ReaxDB's default, and `put` followed by `flush()` in Hive. Hive's plain `put`
+returns before the data is flushed. "ReaxDB memory" is a database opened with
+`keepInMemory: true`.
+
+**100,000 documents**
+
+| Scenario | ReaxDB | ReaxDB memory | Hive |
+| --- | ---: | ---: | ---: |
+| Durable write, one at a time | 16.9k/s | 17.6k/s | 22.7k/s |
+| Write that survives an app kill (`SyncMode.os`) | 33.1k/s | | |
+| Write with no guarantee | 53.3k/s (`SyncMode.none`) | | 77.7k/s (`put`) |
+| Durable batch of 500 | 59.9k/s | | 323.7k/s |
+| Read, warm | 29.5k/s | 1.03M/s (`getSync` 1.23M/s) | 0.73M/s |
+| Read, after reopening | 31.0k/s | 1.15M/s | 0.69M/s |
+| Open | 10.9 ms | 388 ms | 263 ms |
+| Iterate every document | 0.30M/s | 1.28M/s | 16.7M/s |
+| Query, 20,000 results | 653 ms (indexed) | 29 ms (no index), 53 ms (indexed) | 5.4 ms (`values.where`) |
+| Size on disk | 31.5 MB | 31.5 MB | 32.0 MB |
+
+**10,000 documents**
+
+| Scenario | ReaxDB | ReaxDB memory | Hive |
+| --- | ---: | ---: | ---: |
+| Durable write, one at a time | 23.4k/s | 22.8k/s | 23.1k/s |
+| Durable batch of 500 | 330k/s | | 396k/s |
+| Read, warm | 0.97M/s | 1.49M/s (`getSync` 1.59M/s) | 1.95M/s |
+| Read, after reopening | 40.6k/s | 1.67M/s | 1.68M/s |
+| Open | 1.8 ms | 37 ms | 19 ms |
+| Iterate every document | 0.48M/s | 1.72M/s | 23.5M/s |
+| Query, 2,000 results | 5.0 ms (indexed) | 1.2 ms (no index) | 0.23 ms |
+
+What this shows:
+
+- **Durable writes cost about the same in both.** The fsync dominates. At
+  100,000 documents ReaxDB is about 25% slower, because flushing and
+  compacting its LSM tree runs inside the write that triggers it.
+- **Batches at scale are ReaxDB's weak spot.** At 100,000 documents a
+  durable `putBatch` runs at a fifth of Hive's `putAll` + `flush()`, for the
+  same reason. Moving that maintenance off the write path is planned for
+  2.5.0.
+- **With `keepInMemory`, point reads are close to Hive's**: 10 to 25%
+  slower at 1,000 and 10,000 documents, and about 1.5 times faster at
+  100,000, where Hive slows down more.
+  Without it, ReaxDB reads from disk and is 20 to 40 times slower.
+- **Opening is the price of keeping everything in memory**, for both: Hive
+  and ReaxDB in memory mode read and decode every document on open. Without
+  `keepInMemory`, ReaxDB opens in about 11 ms at 100,000 documents.
+- **Iteration and queries are still clearly faster in Hive.** Hive hands
+  out the objects it stores; ReaxDB returns copies, so changing a result
+  never changes the database, and its scans are streams. A query that
+  returns 20,000 documents copies 20,000 maps.
+- **On disk the two are the same size.**
+
+These are numbers for one machine and one document shape. Benchmark your
+own data before deciding.
 
 ## 2.1.0 against 2.0.0
 
