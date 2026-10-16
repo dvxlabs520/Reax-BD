@@ -144,11 +144,12 @@ void main() {
       for (int i = 0; i < count; i++) {
         await db.put('soon:$i', <String, dynamic>{
           'v': i,
-        }, ttl: const Duration(milliseconds: 250));
+        }, ttl: const Duration(seconds: 1));
       }
+      // 200 writes plus a read must fit in the TTL on a slow CI runner.
       expect((await db.get<Map<String, dynamic>>('soon:0'))!['v'], 0);
 
-      await Future<void>.delayed(const Duration(milliseconds: 600));
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
 
       for (int i = 0; i < count; i++) {
         expect(

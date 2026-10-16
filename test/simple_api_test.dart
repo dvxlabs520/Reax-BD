@@ -56,9 +56,10 @@ void main() {
     });
 
     test('TTL entries expire', () async {
-      await db.put('session', 'token', ttl: const Duration(milliseconds: 30));
+      // Long enough for a durable put and a read on a slow CI runner.
+      await db.put('session', 'token', ttl: const Duration(seconds: 1));
       expect(await db.get('session'), 'token');
-      await Future<void>.delayed(const Duration(milliseconds: 60));
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
       expect(await db.get('session'), isNull);
     });
   });

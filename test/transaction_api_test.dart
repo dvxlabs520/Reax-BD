@@ -116,10 +116,11 @@ void main() {
   test('transactional writes honor TTL', () async {
     await db.transaction<void>(
       (ReaxTransaction tx) =>
-          tx.put('temp', 'v', ttl: const Duration(milliseconds: 30)),
+          // Long enough for a durable commit and a read on a slow CI runner.
+          tx.put('temp', 'v', ttl: const Duration(seconds: 1)),
     );
     expect(await db.get<String>('temp'), 'v');
-    await Future<void>.delayed(const Duration(milliseconds: 60));
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
     expect(await db.get<String>('temp'), isNull);
   });
 
