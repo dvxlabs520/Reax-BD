@@ -7,6 +7,8 @@ import 'package:reaxdb_dart/src/core/storage/storage_engine.dart';
 import 'package:reaxdb_dart/src/core/wal/write_ahead_log.dart';
 import 'package:test/test.dart';
 
+import '../support/temp_dir.dart';
+
 Uint8List _b(String s) => Uint8List.fromList(utf8.encode(s));
 
 /// Engine-level crash recovery: the engine is abandoned without close
@@ -18,9 +20,9 @@ void main() {
     dir = await Directory.systemTemp.createTemp('crash_recovery_test_');
   });
 
-  tearDown(() async {
-    if (await dir.exists()) await dir.delete(recursive: true);
-  });
+  // The tests abandon engines on purpose, and Windows refuses to delete
+  // files that are still open.
+  tearDown(() => deleteTempDirectory(dir));
 
   Future<LsmStorageEngine> openEngine({SyncMode syncMode = SyncMode.full}) =>
       LsmStorageEngine.open(directory: dir.path, syncMode: syncMode);

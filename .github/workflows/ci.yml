@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         # The current stable release and the one before it.
-        flutter: ['3.47.7', '3.44.8']
+        flutter: ['3.47.7', '3.44.9']
         os: [ubuntu-latest, macos-latest]
         include:
           - os: windows-latest

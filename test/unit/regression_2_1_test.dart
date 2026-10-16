@@ -299,15 +299,22 @@ void main() {
       await db.close();
     });
 
-    test('the lock file records the process id', () async {
-      final String path = p.join(root.path, 'pid');
-      final ReaxDB db = await ReaxDB.open(path: path);
-      final String contents = await File(
-        p.join(path, ReaxDB.lockFileName),
-      ).readAsString();
-      expect(contents.split('\n').first, '$pid');
-      await db.close();
-    });
+    test(
+      'the lock file records the process id',
+      () async {
+        final String path = p.join(root.path, 'pid');
+        final ReaxDB db = await ReaxDB.open(path: path);
+        final String contents = await File(
+          p.join(path, ReaxDB.lockFileName),
+        ).readAsString();
+        expect(contents.split('\n').first, '$pid');
+        await db.close();
+      },
+      skip: Platform.isWindows
+          ? 'Windows file locks are mandatory: another handle cannot read the '
+                'lock file while the database holds it'
+          : false,
+    );
   });
 
   test('file system failures surface as StorageException', () async {

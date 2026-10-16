@@ -347,7 +347,8 @@ void main() {
               contains('migrateFrom1x'),
               contains('LegacyMigrationMode.automatic'),
               contains('LegacyMigrationMode.off'),
-              contains(legacyPath),
+              // ReaxDB reports canonical paths, which Windows lowercases.
+              contains(p.canonicalize(legacyPath)),
             ),
           ),
         ),
