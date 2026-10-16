@@ -1,6 +1,6 @@
 name: reaxdb_dart
 description: "Embedded NoSQL database for Dart. LSM storage with a write-ahead log, ACID transactions, secondary indexes, AES-256-GCM encryption, TTL and change streams. No native dependencies."
-version: 2.5.0
+version: 2.6.0
 homepage: https://github.com/dvxlabs520/Reax-BD
 repository: https://github.com/dvxlabs520/Reax-BD
 issue_tracker: https://github.com/dvxlabs520/Reax-BD/issues
