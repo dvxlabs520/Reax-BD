@@ -139,6 +139,48 @@ void main() {
     await e.close();
   });
 
+  test('forEachOldestFirst rebuilds exactly what a scan returns', () async {
+    final e = await LsmStorageEngine.open(
+      directory: dir.path,
+      memtableSizeBytes: 8 * 1024,
+      l0CompactionTrigger: 2,
+      baseLevelTargetBytes: 32 * 1024,
+      targetTableBytes: 8 * 1024,
+    );
+    for (var round = 0; round < 4; round++) {
+      for (var i = 0; i < 1500; i++) {
+        if ((i + round) % 5 == 0) {
+          await e.delete(_b(_k(i)));
+        } else {
+          await e.put(_b(_k(i)), _b('r$round-$i'));
+        }
+      }
+    }
+    // Leave some data in memtables too, sealed and active.
+    for (var i = 0; i < 40; i++) {
+      await e.put(_b(_k(i)), _b('last-$i'));
+    }
+    expect(
+      e.stats.levelTableCounts.where((int c) => c > 0).length,
+      greaterThan(1),
+    );
+
+    final rebuilt = <String, String>{};
+    await e.forEachOldestFirst((Uint8List key, Uint8List? value) {
+      if (value == null) {
+        rebuilt.remove(utf8.decode(key));
+      } else {
+        rebuilt[utf8.decode(key)] = utf8.decode(value);
+      }
+    });
+    final scanned = <String, String>{
+      await for (final KeyValue kv in e.scan())
+        utf8.decode(kv.key): utf8.decode(kv.value),
+    };
+    expect(rebuilt, scanned);
+    await e.close();
+  });
+
   group('a crash at each step of the flush loses nothing', () {
     Future<void> crashDuring(IoOp failing) async {
       final errors = <Object>[];

@@ -460,6 +460,34 @@ final class LsmTree {
     return _pinned(mergeEntryStreams(sources, reverse: reverse), v);
   }
 
+  /// Calls [visit] with every entry of every table, OLDEST data first: the
+  /// deepest level first and L0 last, in flush order. A later call for a
+  /// key supersedes an earlier one; a null value is a tombstone.
+  ///
+  /// The current set of tables is pinned when this is called, and each
+  /// table is read with one I/O, so loading a database costs one await per
+  /// table instead of one per entry.
+  Future<void> forEachOldestFirst(
+    void Function(Uint8List key, Uint8List? value) visit,
+  ) async {
+    _ensureOpen();
+    final v = _pin();
+    try {
+      final levels = v.levels;
+      final ordered = <_TableHandle>[
+        for (var l = levels.length - 1; l >= 1; l--) ...levels[l],
+        if (levels.isNotEmpty) ...levels[0],
+      ];
+      for (final h in ordered) {
+        for (final e in await h.table.readAll()) {
+          visit(e.key, e.value);
+        }
+      }
+    } finally {
+      _unpin(v);
+    }
+  }
+
   Stream<SSTableEntry> _pinned(Stream<SSTableEntry> s, _Version v) async* {
     try {
       yield* s;

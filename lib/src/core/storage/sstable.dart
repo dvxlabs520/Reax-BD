@@ -719,6 +719,12 @@ final class SSTable {
   /// Streams every entry in key order (used by compaction).
   Stream<SSTableEntry> scanAll() => range();
 
+  /// Every entry in key order, read with one I/O and validated like any
+  /// other read. Used to load a whole database into memory.
+  Future<List<SSTableEntry>> readAll() => _entryCount == 0
+      ? Future<List<SSTableEntry>>.value(<SSTableEntry>[])
+      : _readBlocks(0, _blockCount);
+
   /// Releases read handles. The file itself is immutable and remains valid.
   Future<void> close() => _pool.close();
 }

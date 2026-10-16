@@ -731,18 +731,27 @@ final class ReaxDB {
   Future<void> _loadMemory() async {
     final MemoryStore? memory = _memory;
     if (memory == null) return;
-    await for (final KeyValue pair in _guardIoStream(
+    // Oldest data first, so newer versions overwrite older ones and
+    // tombstones remove what they delete: no merge, and one await per
+    // table instead of one per entry.
+    await _guardIo(
       _path,
-      _storage.scan(startKey: _userKeySpaceStart),
-    )) {
-      // Decrypted now, which also proves the key; decoded on first read.
-      final Uint8List envelope = _toEnvelope(pair.value, pair.key);
-      memory.putEncoded(
-        utf8.decode(pair.key),
-        envelope,
-        RecordEnvelope.peekExpiry(envelope),
-      );
-    }
+      () => _storage.forEachOldestFirst((Uint8List key, Uint8List? value) {
+        if (key.isEmpty || key[0] == 0x00) return; // index key space
+        final String userKey = utf8.decode(key);
+        if (value == null) {
+          memory.remove(userKey);
+          return;
+        }
+        // Decrypted now, which also proves the key; decoded on first read.
+        final Uint8List envelope = _toEnvelope(value, key);
+        memory.putEncoded(
+          userKey,
+          envelope,
+          RecordEnvelope.peekExpiry(envelope),
+        );
+      }),
+    );
   }
 
   /// Live transaction statistics.

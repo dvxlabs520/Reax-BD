@@ -444,6 +444,31 @@ final class LsmStorageEngine implements StorageEngine {
     }
   }
 
+  /// Calls [visit] with every stored entry, OLDEST data first: the tables
+  /// from the deepest level up, then the sealed memtables, then the active
+  /// one. A later call for a key supersedes an earlier one; a null value is
+  /// a tombstone. Internal keys are included.
+  ///
+  /// Meant for loading a whole database into memory before it accepts
+  /// writes: the memtables are captured together with the tables, but a
+  /// write made while this runs may or may not be seen.
+  Future<void> forEachOldestFirst(
+    void Function(Uint8List key, Uint8List? value) visit,
+  ) async {
+    _ensureOpen();
+    final List<MemTable> memtables = <MemTable>[
+      for (final _SealedMemtable sealed in _sealed) sealed.table,
+      _memtable,
+    ];
+    // Pins the tables synchronously, in the same step as the capture above.
+    await _lsm.forEachOldestFirst(visit);
+    for (final MemTable table in memtables) {
+      for (final e in table.entries) {
+        visit(e.key.bytes, e.value.isTombstone ? null : e.value.value);
+      }
+    }
+  }
+
   /// Escalates the durability of everything written so far to [mode].
   ///
   /// The engine's configured sync mode already applies to every batch; this
