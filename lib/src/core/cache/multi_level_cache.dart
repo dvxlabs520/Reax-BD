@@ -4,7 +4,7 @@
 /// ever written, evicted entries were discarded instead of demoted, and one
 /// logical miss was counted three times. It has been replaced by [ReaxCache],
 /// one well-implemented LRU cache with TTL support, byte-accurate memory
-/// accounting, honest statistics, and O(log n + k) prefix invalidation.
+/// accounting and honest statistics.
 ///
 /// ## Cached representation (IMPORTANT for callers)
 ///
@@ -64,12 +64,17 @@ final class CacheStatistics {
 /// Mutable cache entry; mutated in place on hits so a lookup allocates
 /// nothing.
 final class _CacheEntry {
-  _CacheEntry(this.value, this.size, this.expiresAt);
+  _CacheEntry(this.key, this.value, this.size, this.expiresAt);
 
+  final String key;
   Uint8List value;
   int size;
   DateTime? expiresAt;
   int accessCount = 1;
+
+  /// Neighbours in recency order ([_newer] is more recently used).
+  _CacheEntry? _older;
+  _CacheEntry? _newer;
 
   bool isExpired(DateTime now) {
     final DateTime? at = expiresAt;
@@ -79,13 +84,13 @@ final class _CacheEntry {
 
 /// LRU cache with per-entry TTL, bounded by entry count and memory.
 ///
-/// - `get`/`put`/`remove` are O(log n) (a sorted view is maintained for
-///   prefix invalidation); no allocation happens on a cache hit.
+/// - `get`/`put`/`remove` are O(1): a hash map finds the entry and an
+///   intrusive linked list keeps the recency order. No allocation happens on
+///   a cache hit.
 /// - Expired entries behave as absent: a `get` removes them and counts one
 ///   miss and one expiration. [removeExpired] reclaims them eagerly.
-/// - [invalidatePattern] handles `*`, `prefix*` and exact keys in O(log n +
-///   matches) via the sorted view; only patterns with other wildcard shapes
-///   fall back to a full O(n) sweep.
+/// - [removePrefix] and [invalidatePattern] sweep every entry, O(n). The
+///   database never calls them on its write path.
 final class ReaxCache {
   /// Creates a cache bounded by [maxEntries] and [maxMemoryBytes].
   ///
@@ -116,11 +121,11 @@ final class ReaxCache {
   final int _maxMemoryBytes;
   final Duration? _defaultTtl;
 
-  /// Recency order: first entry is least recently used.
-  final LinkedHashMap<String, _CacheEntry> _lru = LinkedHashMap();
+  final HashMap<String, _CacheEntry> _entries = HashMap<String, _CacheEntry>();
 
-  /// Key-sorted view of the same entries, for prefix operations.
-  final SplayTreeMap<String, _CacheEntry> _byKey = SplayTreeMap();
+  /// Least and most recently used ends of the recency list.
+  _CacheEntry? _oldest;
+  _CacheEntry? _newest;
 
   int _memoryBytes = 0;
   int _hits = 0;
@@ -129,7 +134,7 @@ final class ReaxCache {
   int _expirations = 0;
 
   /// Number of live entries.
-  int get length => _lru.length;
+  int get length => _entries.length;
 
   /// Approximate memory held by live entries.
   int get memoryBytes => _memoryBytes;
@@ -140,27 +145,25 @@ final class ReaxCache {
     misses: _misses,
     evictions: _evictions,
     expirations: _expirations,
-    entryCount: _lru.length,
+    entryCount: _entries.length,
     memoryBytes: _memoryBytes,
   );
 
   /// Returns the cached plaintext bytes for [key], or null when absent or
   /// expired. A hit refreshes the entry's recency without allocating.
   Uint8List? get(String key) {
-    final _CacheEntry? entry = _lru[key];
+    final _CacheEntry? entry = _entries[key];
     if (entry == null) {
       _misses++;
       return null;
     }
     if (entry.isExpired(DateTime.now())) {
-      _removeEntry(key, entry);
+      _removeEntry(entry);
       _expirations++;
       _misses++;
       return null;
     }
-    // Refresh recency: reinsert the SAME entry object (no allocation).
-    _lru.remove(key);
-    _lru[key] = entry;
+    _touch(entry);
     entry.accessCount++;
     _hits++;
     return entry.value;
@@ -169,7 +172,7 @@ final class ReaxCache {
   /// Whether a live (non-expired) entry exists for [key]. Does not affect
   /// recency or statistics.
   bool containsKey(String key) {
-    final _CacheEntry? entry = _lru[key];
+    final _CacheEntry? entry = _entries[key];
     return entry != null && !entry.isExpired(DateTime.now());
   }
 
@@ -186,57 +189,58 @@ final class ReaxCache {
             ? DateTime.now().add(ttl)
             : (_defaultTtl != null ? DateTime.now().add(_defaultTtl) : null));
 
-    final _CacheEntry? existing = _lru.remove(key);
+    final _CacheEntry? existing = _entries[key];
     if (existing != null) {
+      // Out of the list while the others are evicted, so it is never the
+      // entry evicted to make room for itself.
+      _unlink(existing);
+      _entries.remove(key);
       _memoryBytes -= existing.size;
       existing.value = value;
       existing.size = size;
       existing.expiresAt = expiry;
       _evictWhile(size);
-      _lru[key] = existing;
+      _entries[key] = existing;
+      _append(existing);
       _memoryBytes += size;
       return;
     }
 
     _evictWhile(size);
-    final _CacheEntry entry = _CacheEntry(value, size, expiry);
-    _lru[key] = entry;
-    _byKey[key] = entry;
+    final _CacheEntry entry = _CacheEntry(key, value, size, expiry);
+    _entries[key] = entry;
+    _append(entry);
     _memoryBytes += size;
   }
 
   /// Removes [key] if present.
   void remove(String key) {
-    final _CacheEntry? entry = _lru[key];
+    final _CacheEntry? entry = _entries[key];
     if (entry != null) {
-      _removeEntry(key, entry);
+      _removeEntry(entry);
     }
   }
 
-  /// Removes every entry whose key starts with [prefix].
-  ///
-  /// O(log n + k) where k is the number of removed entries.
+  /// Removes every entry whose key starts with [prefix]. O(n).
   void removePrefix(String prefix) {
     if (prefix.isEmpty) {
       clear();
       return;
     }
-    String? key = _byKey.containsKey(prefix)
-        ? prefix
-        : _byKey.firstKeyAfter(prefix);
-    while (key != null && key.startsWith(prefix)) {
-      final String next = key;
-      final String? following = _byKey.firstKeyAfter(next);
-      _removeEntry(next, _byKey[next]!);
-      key = following;
+    final List<_CacheEntry> matching = <_CacheEntry>[
+      for (final _CacheEntry entry in _entries.values)
+        if (entry.key.startsWith(prefix)) entry,
+    ];
+    for (final _CacheEntry entry in matching) {
+      _removeEntry(entry);
     }
   }
 
   /// Invalidates keys matching [pattern].
   ///
-  /// `*` clears the cache; `prefix*` (no other special characters) uses the
-  /// O(log n + k) prefix path; any other pattern is treated as a regular
-  /// expression and requires a full O(n) key sweep.
+  /// `*` clears the cache; `prefix*` (no other special characters) removes
+  /// by prefix; any other pattern is treated as a regular expression. Both
+  /// sweep every key, O(n).
   void invalidatePattern(String pattern) {
     if (pattern == '*') {
       clear();
@@ -255,7 +259,7 @@ final class ReaxCache {
     }
     final RegExp regex = RegExp(pattern);
     final List<String> toRemove = [
-      for (final String key in _lru.keys)
+      for (final String key in _entries.keys)
         if (regex.hasMatch(key)) key,
     ];
     for (final String key in toRemove) {
@@ -266,12 +270,12 @@ final class ReaxCache {
   /// Removes every expired entry now and returns how many were removed.
   int removeExpired() {
     final DateTime now = DateTime.now();
-    final List<String> expired = [
-      for (final MapEntry<String, _CacheEntry> e in _lru.entries)
-        if (e.value.isExpired(now)) e.key,
+    final List<_CacheEntry> expired = <_CacheEntry>[
+      for (final _CacheEntry entry in _entries.values)
+        if (entry.isExpired(now)) entry,
     ];
-    for (final String key in expired) {
-      _removeEntry(key, _lru[key]!);
+    for (final _CacheEntry entry in expired) {
+      _removeEntry(entry);
       _expirations++;
     }
     return expired.length;
@@ -279,24 +283,60 @@ final class ReaxCache {
 
   /// Removes every entry. Statistics counters are preserved.
   void clear() {
-    _lru.clear();
-    _byKey.clear();
+    _entries.clear();
+    _oldest = null;
+    _newest = null;
     _memoryBytes = 0;
   }
 
-  void _removeEntry(String key, _CacheEntry entry) {
-    _lru.remove(key);
-    _byKey.remove(key);
+  void _removeEntry(_CacheEntry entry) {
+    _entries.remove(entry.key);
+    _unlink(entry);
     _memoryBytes -= entry.size;
   }
 
+  /// Marks [entry] as the most recently used.
+  void _touch(_CacheEntry entry) {
+    if (identical(entry, _newest)) return;
+    _unlink(entry);
+    _append(entry);
+  }
+
+  void _append(_CacheEntry entry) {
+    entry._older = _newest;
+    entry._newer = null;
+    final _CacheEntry? newest = _newest;
+    if (newest != null) {
+      newest._newer = entry;
+    } else {
+      _oldest = entry;
+    }
+    _newest = entry;
+  }
+
+  void _unlink(_CacheEntry entry) {
+    final _CacheEntry? older = entry._older;
+    final _CacheEntry? newer = entry._newer;
+    if (older != null) {
+      older._newer = newer;
+    } else if (identical(_oldest, entry)) {
+      _oldest = newer;
+    }
+    if (newer != null) {
+      newer._older = older;
+    } else if (identical(_newest, entry)) {
+      _newest = older;
+    }
+    entry._older = null;
+    entry._newer = null;
+  }
+
   void _evictWhile(int incomingSize) {
-    while (_lru.isNotEmpty &&
-        (_lru.length >= _maxEntries ||
+    while (_entries.isNotEmpty &&
+        (_entries.length >= _maxEntries ||
             _memoryBytes + incomingSize > _maxMemoryBytes)) {
-      final String lruKey = _lru.keys.first;
-      final _CacheEntry entry = _lru[lruKey]!;
-      _removeEntry(lruKey, entry);
+      final _CacheEntry entry = _oldest!;
+      _removeEntry(entry);
       if (entry.isExpired(DateTime.now())) {
         _expirations++;
       } else {
