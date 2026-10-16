@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] - 2.5.0
+## [2.5.0] - 2026-10-16
+
+Faster where it matters for apps: an in-memory mode for reads, writes that
+no longer stall on maintenance, and key rotation. The on-disk format is
+unchanged: 2.5 opens 2.0 and 2.1 databases and archives as they are.
 
 ### Added
 
@@ -45,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Files inside the directory keep the process's default permissions, but
   other users can no longer reach them. No effect on Windows.
 - Opening with `keepInMemory: true` reads each SSTable with one I/O instead
-  of streaming entry by entry: about 168 ms instead of 306 ms for 100,000
+  of streaming entry by entry: about 177 ms instead of 316 ms for 100,000
   documents.
 
 - Flushing a full memtable and compacting the LSM tree now happen in the

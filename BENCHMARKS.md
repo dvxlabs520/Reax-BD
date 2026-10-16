@@ -67,9 +67,9 @@ page, with [`benchmark/hive_comparison.dart`](benchmark/hive_comparison.dart)
 built AOT, against `hive_ce` 2.22.0. Both databases store the same documents
 (`{id, name, category, score, active, payload}` with a 200-byte payload).
 Every scenario ran three times on a fresh database, and the median
-repetition is reported. The ReaxDB numbers are from the 2.5.0 development
-branch, which adds `keepInMemory` and moves LSM maintenance off the write
-path.
+repetition is reported. The ReaxDB numbers are from 2.5.0, which adds
+`keepInMemory` and moves LSM maintenance off the write path. The open rows
+were measured again after the last change to how memory mode loads.
 
 ```bash
 dart compile exe benchmark/hive_comparison.dart -o hive_comparison
@@ -91,7 +91,7 @@ returns before the data is flushed. "ReaxDB memory" is a database opened with
 | Durable batch of 500 | 199.5k/s | | 309.1k/s |
 | Read, warm | 44.3k/s | 0.99M/s (`getSync` 1.16M/s) | 0.78M/s |
 | Read, first after reopening | 42.9k/s | 0.61M/s | 0.77M/s |
-| Open | 10.7 ms | 316 ms | 263 ms |
+| Open | 11.0 ms | 177 ms | 261 ms |
 | Iterate every document once | 0.18M/s | 0.53M/s | 18.1M/s |
 | Query, 20,000 results | 449 ms (indexed) | 24 ms (no index), 74 ms (indexed) | 3.9 ms (`values.where`) |
 | Size on disk | 31.5 MB | 31.5 MB | 32.0 MB |
@@ -104,7 +104,7 @@ returns before the data is flushed. "ReaxDB memory" is a database opened with
 | Durable batch of 500 | 336k/s | | 419k/s |
 | Read, warm | 1.07M/s | 1.33M/s (`getSync` 2.20M/s) | 2.22M/s |
 | Read, first after reopening | 44.2k/s | 0.71M/s | 1.62M/s |
-| Open | 1.7 ms | 29 ms | 20 ms |
+| Open | 1.8 ms | 15 ms | 20 ms |
 | Iterate every document once | 0.47M/s | 0.72M/s | 26.5M/s |
 | Query, 2,000 results | 4.7 ms (indexed) | 1.1 ms (no index) | 0.23 ms |
 
@@ -124,8 +124,10 @@ What this shows:
   The first read of each value after opening decodes it, so it is slower
   than Hive, which decodes everything while opening. Without `keepInMemory`,
   ReaxDB reads from disk.
-- **Opening in memory mode takes about as long as Hive**, a little longer at
-  100,000 documents. Without `keepInMemory`, ReaxDB opens in about 11 ms.
+- **Opening in memory mode is faster than Hive's open**: 177 ms against
+  261 ms at 100,000 documents. ReaxDB loads each table with one read and
+  decodes values on first use, while Hive decodes everything up front.
+  Without `keepInMemory`, ReaxDB opens in about 11 ms.
 - **Iteration and queries are still clearly faster in Hive.** Hive hands
   out the objects it stores; ReaxDB returns copies, so changing a result
   never changes the database, and its scans are streams. A query that
@@ -307,8 +309,7 @@ those calls flushed the memtable and ran a multi-level compaction inline.
 
 Since 2.5.0 flushing and compaction run in the background, after the write
 that triggered them, and the default level sizes rewrite data about half as
-often. Measured the same way on the 2.5.0 development branch, at 100,000
-documents:
+often. Measured the same way with 2.5.0, at 100,000 documents:
 
 | scenario | sync | p99 | max | ops/sec |
 | --- | --- | ---: | ---: | ---: |

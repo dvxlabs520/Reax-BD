@@ -89,7 +89,7 @@ smaller sizes in [BENCHMARKS.md](BENCHMARKS.md#reaxdb-and-hive)):
 | Durable write | 19.0k/s | 19.2k/s | 23.5k/s (`put` + `flush`) |
 | Batch of 500 | 199.5k/s | | 309.1k/s |
 | Read | 44.3k/s | 0.99M/s | 0.78M/s |
-| Open | 11 ms | 316 ms | 263 ms |
+| Open | 11 ms | 177 ms | 261 ms |
 | Query, 20,000 results | 449 ms | 24 ms | 3.9 ms (`values.where`) |
 
 Choose Hive if you need the web, or the fastest possible iteration over
