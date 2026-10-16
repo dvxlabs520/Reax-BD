@@ -60,8 +60,10 @@ export 'src/core/query/aggregation.dart'
 export 'src/core/indexing/secondary_index.dart'
     show IndexDefinition, compareValues, extractFieldValue, valuesEqual;
 
-// Cache statistics (the cache itself is internal).
+// Cache and storage statistics (the cache and engine themselves are
+// internal).
 export 'src/core/cache/multi_level_cache.dart' show CacheStatistics;
+export 'src/core/storage/storage_engine.dart' show StorageStats;
 
 // Encryption configuration (the engine itself is internal).
 export 'src/core/encryption/encryption_config.dart'

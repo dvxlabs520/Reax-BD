@@ -372,7 +372,8 @@ void main() {
 
         final IndexManager reloaded = IndexManager(
           storage: engine,
-          decodeDocument: decodeJsonDocument,
+          decodeDocument: (Uint8List _, Uint8List bytes) =>
+              decodeJsonDocument(bytes),
         );
         await reloaded.loadIndexes();
 
@@ -395,7 +396,8 @@ void main() {
       expect(await indexManager.candidateIds('users', [eq('age', 30)]), isNull);
       final IndexManager reloaded = IndexManager(
         storage: engine,
-        decodeDocument: decodeJsonDocument,
+        decodeDocument: (Uint8List _, Uint8List bytes) =>
+            decodeJsonDocument(bytes),
       );
       await reloaded.loadIndexes();
       expect(reloaded.listIndexes(), isEmpty);

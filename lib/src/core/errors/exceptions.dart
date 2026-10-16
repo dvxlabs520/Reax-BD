@@ -149,3 +149,36 @@ final class QueryException extends ReaxDbException {
   /// Creates a query exception.
   const QueryException(super.message, {super.cause});
 }
+
+/// Thrown when the file system fails an operation ReaxDB needs.
+///
+/// Examples: the database directory cannot be created (on iOS and Android a
+/// relative path such as `'myapp'` resolves against a read-only working
+/// directory; pass an absolute path, for example from `path_provider`), the
+/// disk is full, or a file cannot be read. [cause] holds the original
+/// `FileSystemException`.
+final class StorageException extends ReaxDbException {
+  /// Creates a storage exception, optionally naming the [path] involved.
+  const StorageException(super.message, {this.path, super.cause});
+
+  /// The file or directory the failed operation addressed.
+  final String? path;
+}
+
+/// Thrown into a change stream whose subscriber fell too far behind.
+///
+/// Each subscription queues at most a bounded number of undelivered events
+/// (see `ReaxDB.open(changeStreamBufferSize: ...)`). Rather than growing
+/// without bound, or dropping events silently, the subscription receives
+/// this error and is closed. Re-read the state you need and subscribe again.
+final class ChangeStreamOverflowException extends ReaxDbException {
+  /// Creates an overflow exception for the subscription to [pattern].
+  const ChangeStreamOverflowException(
+    super.message, {
+    this.pattern,
+    super.cause,
+  });
+
+  /// The watched pattern.
+  final String? pattern;
+}

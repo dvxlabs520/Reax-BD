@@ -213,17 +213,36 @@ abstract final class LegacySSTableReader {
     truncated: false,
   );
 
+  /// The LSM level and creation time encoded in the name of the 1.x SSTable
+  /// at [filePath], exactly as [read] reports them in [LegacySSTable.level]
+  /// and [LegacySSTable.createdAt], without reading the file.
+  ///
+  /// A name that does not match `level_<n>_<timestamp>.sst` is level 0,
+  /// created at the epoch. Lets a caller order tables by 1.x read precedence
+  /// before reading them, so they can be processed one at a time.
+  static ({int level, DateTime createdAt}) identify(String filePath) {
+    final _FileIdentity identity =
+        _matchFileName(p.basename(filePath)) ?? _FileIdentity.unknown;
+    return (level: identity.level, createdAt: identity.createdAt);
+  }
+
   static _FileIdentity _parseFileName(String name, List<String> warnings) {
-    final RegExpMatch? match = RegExp(
-      r'^level_(\d+)_(\d+)\.sst$',
-    ).firstMatch(name);
-    if (match == null) {
+    final _FileIdentity? identity = _matchFileName(name);
+    if (identity == null) {
       warnings.add(
         '$name: file name does not match the 1.x pattern '
         'level_<level>_<timestamp>.sst; assuming level 0',
       );
-      return _FileIdentity(0, DateTime.fromMillisecondsSinceEpoch(0));
+      return _FileIdentity.unknown;
     }
+    return identity;
+  }
+
+  static _FileIdentity? _matchFileName(String name) {
+    final RegExpMatch? match = RegExp(
+      r'^level_(\d+)_(\d+)\.sst$',
+    ).firstMatch(name);
+    if (match == null) return null;
     return _FileIdentity(
       int.parse(match.group(1)!),
       DateTime.fromMillisecondsSinceEpoch(int.parse(match.group(2)!)),
@@ -332,6 +351,11 @@ abstract final class LegacySSTableReader {
 
 final class _FileIdentity {
   const _FileIdentity(this.level, this.createdAt);
+
+  static final _FileIdentity unknown = _FileIdentity(
+    0,
+    DateTime.fromMillisecondsSinceEpoch(0),
+  );
 
   final int level;
   final DateTime createdAt;

@@ -249,16 +249,15 @@ abstract final class LegacyWalReader {
       key: Uint8List.fromList(
         Uint8List.sublistView(payload, keyStart, keyStart + keyLength),
       ),
-      value:
-          valueLength > 0
-              ? Uint8List.fromList(
-                Uint8List.sublistView(
-                  payload,
-                  valueStart,
-                  valueStart + valueLength,
-                ),
-              )
-              : null,
+      value: valueLength > 0
+          ? Uint8List.fromList(
+              Uint8List.sublistView(
+                payload,
+                valueStart,
+                valueStart + valueLength,
+              ),
+            )
+          : null,
       sequenceNumber: sequenceNumber,
       timestampMs: timestampMs,
       sourceFile: sourceFile,

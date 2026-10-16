@@ -41,6 +41,14 @@ elapsed time, warnings) is logged at info level. Once the migration has run,
 the directory is an ordinary 2.0 database and the mode no longer matters; it
 is safe to leave the parameter in place.
 
+Since 2.1 the migration is crash-safe. Everything that can fail (detection,
+the legacy key) is checked before the 1.x files are touched. The new database
+is built in a sibling staging directory and only moved into place once it is
+complete. If the app dies midway, the next `ReaxDB.open` of that path
+finishes or discards the interrupted migration before opening: you end up
+with either the untouched 1.x database or the complete migrated one, never an
+empty or partial database.
+
 ### Manual: migrate explicitly, then open
 
 Use this when you want the report in hand — to show progress, to check
@@ -391,9 +399,11 @@ explicit error handling.
 
 ### One writer per path
 
-Opening the same directory twice — in one isolate or across processes — now
-throws `DatabaseLockedException` instead of producing two engines that corrupt
-each other's files.
+Opening the same directory twice now throws `DatabaseLockedException`
+instead of producing two engines that corrupt each other's files. Since 2.1
+that covers two isolates of the same process (for example a Flutter
+background isolate) and the same directory reached through a symlink or a
+differently cased path, not only two processes.
 
 ## Renamed, removed and shimmed: the full table
 

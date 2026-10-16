@@ -75,11 +75,10 @@ void main() {
       for (final k in ['a', 'b', 'c', 'd']) {
         table.put(_b(k), _b('v$k'));
       }
-      final slice =
-          table
-              .range(ByteKey.fromString('b'), ByteKey.fromString('d'))
-              .map((e) => e.key.asString)
-              .toList();
+      final slice = table
+          .range(ByteKey.fromString('b'), ByteKey.fromString('d'))
+          .map((e) => e.key.asString)
+          .toList();
       expect(slice, ['b', 'c']);
     });
   });

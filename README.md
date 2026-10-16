@@ -6,9 +6,10 @@ dependencies.
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dvillegastech/Reax-BD)
 
-> **2.0.0 is a rewrite.** The storage engine, transaction manager, query
-> layer, encryption and public API all changed. Data written by 1.x cannot be
-> read by 2.0 — see [MIGRATION.md](MIGRATION.md).
+> **Upgrading from 1.x?** 2.0 rewrote the storage engine and the public
+> API. Your 1.x data migrates (encrypted data too) and most 1.x code still
+> compiles. See [Upgrading from 1.x](#upgrading-from-1x) and
+> [MIGRATION.md](MIGRATION.md).
 
 ## What it is
 
@@ -24,8 +25,9 @@ dependencies.
 - **Not a web database.** The engine writes files through `dart:io`. It runs
   on the Dart VM and on Flutter for Android, iOS, macOS, Windows and Linux.
   It does not run on Flutter Web.
-- **Not a client/server database.** One process opens a database directory at
-  a time, enforced by an OS advisory lock.
+- **Not a client/server database.** One instance opens a database directory
+  at a time: one process, and within it one isolate. This is enforced by a
+  file lock.
 - **Not the fastest database in every benchmark.** See
   [BENCHMARKS.md](BENCHMARKS.md) for measured numbers from a reproducible
   harness, with the machine and methodology stated. We do not publish
@@ -35,8 +37,10 @@ dependencies.
 
 ```yaml
 dependencies:
-  reaxdb_dart: ^2.0.0
+  reaxdb_dart: ^2.1.0
 ```
+
+Requires Dart 3.12 or later (Flutter 3.44 or later).
 
 ## Quick start
 
@@ -44,7 +48,7 @@ dependencies:
 import 'package:reaxdb_dart/reaxdb_dart.dart';
 
 Future<void> main() async {
-  final db = await ReaxDB.open(path: 'data/myapp');
+  final db = await ReaxDB.open(path: '/absolute/path/to/myapp');
 
   await db.put('user:1', {'name': 'Ada', 'age': 36});
   final user = await db.get<Map<String, dynamic>>('user:1');
@@ -53,10 +57,24 @@ Future<void> main() async {
 }
 ```
 
-Or the small API, which covers plain key/value use:
+**In a Flutter app, use an absolute path.** iOS and Android resolve a
+relative path such as `'myapp'` against a read-only directory, and opening
+fails with a `StorageException`. Use a directory from
+[`path_provider`](https://pub.dev/packages/path_provider):
 
 ```dart
-final db = await ReaxDB.simple('myapp');
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+
+final support = await getApplicationSupportDirectory();
+final db = await ReaxDB.open(path: p.join(support.path, 'myapp'));
+```
+
+Or the small API, which covers plain key/value use. It takes the same
+absolute `path:`:
+
+```dart
+final db = await ReaxDB.simple('myapp', path: p.join(support.path, 'myapp'));
 await db.put('user:1', {'name': 'Ada'});
 final user = await db.get('user:1');
 await db.close();
@@ -88,7 +106,17 @@ effective sync mode promises:
 | --- | --- | --- |
 | `none` | WAL records buffered in memory, written opportunistically | nothing guaranteed |
 | `os` | WAL records handed to the OS with `write()` before the call returns | process kill |
-| `full` (default) | WAL records fsynced with `RandomAccessFile.flush()` before the call returns | power loss |
+| `full` (default) | WAL records fsynced with `RandomAccessFile.flush()` before the call returns | OS crash and power loss, within the limits below |
+
+Limits of `full`:
+
+- On macOS and iOS, `fsync` hands the data to the drive but does not force
+  the drive to empty its own write cache (that takes `F_FULLFSYNC`, which
+  ReaxDB does not issue, as SQLite does not by default). A power cut at the
+  wrong moment can still lose the last writes the drive had cached.
+- File creations, renames and deletions are made durable by fsyncing their
+  directory, through `dart:ffi` on Linux, Android, macOS and iOS. Windows
+  journals this metadata itself.
 
 ```dart
 final db = await ReaxDB.open(path: 'data/app', syncMode: SyncMode.os);
@@ -102,9 +130,9 @@ the database default.
 
 ### The single write pipeline
 
-Every mutation — `put`, `putBatch`, `delete`, `deleteBatch`, typed collection
-writes, query-driven `update`/`delete`, and TTL reclamation — flows through
-one internal method that applies, in order:
+Every mutation — `put`, `putBatch`, `delete`, `deleteBatch`, transactions,
+typed collection writes, query-driven `update`/`delete`, and TTL
+reclamation — flows through one internal pipeline that applies, in order:
 
 1. build the batch (value operation + secondary index operations),
 2. `writeBatch` — **the durability point**,
@@ -116,11 +144,9 @@ Nothing observable happens before step 2. The cache is never written before a
 write is durable, so a failed write cannot leave a phantom cache entry, and
 change events never announce a write that is not on disk.
 
-Transactions are the one two-phase case: the transaction manager owns the
-atomic batch for the values, and the database runs index maintenance, cache
-invalidation and events immediately after the commit returns. Index updates
-for transactional writes are therefore durable in a second batch that follows
-the commit.
+A transaction commits inside the same pipeline: its values and their index
+postings go into one atomic batch, and no other write can run between its
+validation, its batch and its cache and event updates.
 
 ## Features
 
@@ -210,8 +236,13 @@ await db.transaction((tx) async {
 Available isolation levels and what they actually provide are documented in
 [ADVANCED.md](ADVANCED.md#isolation-levels).
 
+The default isolation level, `readCommitted`, does not prevent lost updates:
+two concurrent read-modify-write transactions on the same key can both
+commit, and one change is lost. Use `IsolationLevel.serializable` for
+read-modify-write logic.
+
 `compareAndSwap` runs its read and write inside one serializable transaction,
-so it is genuinely atomic:
+so it is genuinely atomic. Maps and lists are compared by content:
 
 ```dart
 final swapped = await db.compareAndSwap<int>('counter', 1, 2);
@@ -229,6 +260,12 @@ final subscription = db.watch('user:*').listen((event) {
 key. Events fire only after the durability point. `ReaxEntry.toString()` and
 `DatabaseChangeEvent.toString()` are redacted: they never print key or value
 content.
+
+A subscription that is paused or slower than the writes queues at most
+`changeStreamBufferSize` events (10,000 by default, set on `ReaxDB.open`).
+One more ends it with a `ChangeStreamOverflowException`, instead of using
+unbounded memory or dropping events silently. Re-read what you need and
+subscribe again.
 
 ### Encryption
 
@@ -249,41 +286,63 @@ final db = await ReaxDB.open(
 Values are wrapped in a self-describing envelope:
 
 ```text
-byte 0      envelope version (0x01)
+byte 0      envelope version (0x02; 0x01 envelopes written by 2.0.0 still read)
 byte 1      algorithm id (0x01 = XOR obfuscation, 0x02 = AES-256-GCM)
 AES-GCM:    bytes 2..13  random 96-bit IV from Random.secure()
             bytes 14..   ciphertext || 16-byte authentication tag
 ```
 
+Each value is authenticated together with its key, so a value copied onto
+another key (or into another database) fails to decrypt instead of being
+accepted.
+
 For a passphrase configuration the random PBKDF2 salt and the iteration count
 are generated on first open and stored in the database header, so later opens
-derive the same key. Reopening with a different algorithm, a different
-iteration count or the wrong key fails loudly with `EncryptionException` —
-ReaxDB never downgrades to a weaker cipher and never silently returns garbage.
+derive the same key. The derivation runs on a background isolate, so it does
+not freeze a Flutter UI. The header also stores a key check, so opening with
+the wrong key or passphrase fails at `open` with `EncryptionException`,
+before anything is read or written. A different algorithm or iteration count
+fails the same way. ReaxDB never downgrades to a weaker cipher and never
+silently returns garbage.
 
 `EncryptionConfig.obfuscation` exists and is honestly named: repeating-key XOR
 is **not** encryption, provides no confidentiality and no integrity, and must
 not be used for sensitive data.
 
-Keys are not encrypted, only values. Key names should not themselves be
-secrets.
+**What is not encrypted:** keys, and the field values stored in secondary
+indexes. With an index on `email`, every email address is readable in the
+database files. Do not index a field whose values are secret, and do not put
+secrets in keys.
 
 ### Backup and restore
 
 ```dart
-await db.exportTo('backups/2026-07-30.rxdb');
+final backupKey = EncryptionConfig.aes256FromPassphrase(passphrase: secret);
+await db.exportTo('backups/2026-10-16.rxdb', encryption: backupKey);
 
 final restored = await ReaxDB.importFrom(
-  archivePath: 'backups/2026-07-30.rxdb',
+  archivePath: 'backups/2026-10-16.rxdb',
   path: 'data/restored',
+  archiveEncryption: backupKey,
 );
 ```
 
-The archive has a magic number, a format version, a SHA-256 digest verified on
-import, the schema version and the index definitions. Its records are stored
-decrypted, so a backup from an encrypted database can be restored into a
-database with different (or no) encryption. Writes are blocked for the
-duration of the snapshot scan, so the archive is a point-in-time image.
+**An archive is plaintext unless you pass `encryption:` to `exportTo`.** Its
+records are decrypted from the database's own encryption, so a backup can be
+restored into a database with different (or no) encryption. With
+`encryption:` every record, key included, is encrypted with AES-256-GCM.
+
+- The archive is streamed, so memory use does not grow with the database.
+- It is written to a temporary file and renamed into place, so a crash never
+  destroys an earlier backup at the same path.
+- It ends with a SHA-256 digest, verified over the whole file before
+  anything is restored. It also holds the schema version and the index
+  definitions.
+- Writes are blocked while the snapshot is taken, so the archive is a
+  point-in-time image.
+- `importFrom` restores into a temporary directory and moves it into place
+  only when complete. With `overwrite: true` it replaces only a ReaxDB
+  database that no instance has open, never any other directory.
 
 ### Schema versions and migrations
 
@@ -306,12 +365,17 @@ reinterpreting old data.
 
 ### One writer per database
 
-A second `ReaxDB.open` of the same path in the same isolate throws
-`DatabaseLockedException`. Across processes the guard is an OS advisory lock
-on `<path>/LOCK`. Because the operating system releases advisory locks when a
-process dies, a crash never leaves a stale lock: the file remains on disk but
-is unlocked, and the next open succeeds. There is no timeout to tune and no
-force-unlock switch.
+A second `ReaxDB.open` of a database that is already open throws
+`DatabaseLockedException`. That holds for another process, for another isolate
+of the same process (for example a background isolate started by a Flutter
+plugin), and for the same directory reached through a symlink or a
+differently cased path. The guard is a `flock` on `<path>/LOCK`, taken
+through `dart:ffi` on Linux, Android, macOS and iOS; on Windows it is the
+`dart:io` file lock, which also excludes other isolates there.
+
+The operating system releases the lock when a process dies, so a crash never
+leaves a stale lock: the file remains on disk but is unlocked, and the next
+open succeeds. There is no timeout to tune and no force-unlock switch.
 
 ## Upgrading from 1.x
 
@@ -359,7 +423,9 @@ Every failure is a subtype of the sealed `ReaxDbException`:
 `DatabaseClosedException`, `DatabaseLockedException`, `InvalidKeyException`,
 `CorruptionException`, `EncryptionException`, `TransactionConflictException`,
 `DeadlockException`, `TransactionTimeoutException`, `SchemaVersionException`,
-`SerializationException`, `QueryException`, `UnsupportedApiException`.
+`SerializationException`, `QueryException`, `UnsupportedApiException`,
+`StorageException` (a file system failure, such as a full disk or a
+directory that cannot be created) and `ChangeStreamOverflowException`.
 
 Nothing is swallowed into a `null` or an empty result.
 

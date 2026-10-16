@@ -21,7 +21,7 @@ has limits, the limits are stated.
 
 ```dart
 final db = await ReaxDB.open(
-  path: 'data/app',
+  path: '/absolute/path/to/app', // on iOS/Android, from path_provider
 
   // Durability.
   syncMode: SyncMode.full,
@@ -36,6 +36,9 @@ final db = await ReaxDB.open(
   cacheMaxEntries: 10000,
   cacheMaxMemoryBytes: 64 * 1024 * 1024,
   cacheDefaultTtl: null,
+
+  // Change streams: undelivered events one subscription may queue.
+  changeStreamBufferSize: 10000,
 
   // Logging.
   logLevel: LogLevel.warning,
@@ -55,7 +58,10 @@ final db = await ReaxDB.open(
 `close()` drains work already accepted, then closes the transaction manager,
 the index manager, the storage engine (which flushes the memtable and closes
 the WAL), the cache, the change-stream hub and the logger, releases the
-on-disk lock and unregisters the instance. It is idempotent.
+on-disk lock and unregisters the instance. It is idempotent, a second call
+made while closing waits for the first, and a failure in one step does not
+skip the others: the lock is always released and the first error is rethrown
+at the end.
 
 `ReaxDB.closeAll()` closes every instance open in the current isolate. It
 exists for tests and for shutdown hooks.
@@ -70,6 +76,12 @@ Reads take no locks and always observe the latest committed value. Writes take
 exclusive key locks held until commit or abort. Dirty reads are impossible
 because uncommitted writes never reach storage. Non-repeatable reads are
 possible.
+
+**Lost updates are possible too.** Two transactions that each read a counter,
+add one and write it back can both commit, and the counter goes up by one:
+the read takes no lock, so neither sees the other. Measured: 20 concurrent
+increments under `readCommitted` end at 1, under `serializable` at 20. Use
+`serializable` (or `compareAndSwap`) for read-modify-write logic.
 
 ### `IsolationLevel.repeatableRead`
 
@@ -90,9 +102,15 @@ query executed outside the transaction is not part of its read set.
 
 ### `IsolationLevel.optimistic`
 
-No locks. Reads record the committed version of each key; commit revalidates
-the version of every key read or written and fails with
-`TransactionConflictException` if any changed. First committer wins.
+No locks. Reads record the committed version of each key (taken before the
+read, so a commit that lands during it is caught); commit revalidates the
+version of every key read or written and fails with
+`TransactionConflictException` if any changed. Plain `put`/`delete` calls
+bump versions too, so an optimistic commit never overwrites a write made
+outside any transaction. First committer wins.
+
+`repeatableRead` and `serializable` currently run the same code: both hold
+shared locks on reads and revalidate the read set at commit.
 
 ### Retries
 
@@ -107,13 +125,17 @@ a detected cycle; exceeding it raises `TransactionTimeoutException`.
 
 ## The write pipeline
 
-One private method, `ReaxDB._applyMutations`, is the only code path that
-mutates storage on behalf of a user write. It runs, in order:
+One private method, `ReaxDB._applyMutations`, mutates storage on behalf of a
+plain user write; transactions commit through the same lock and the same
+ordering (see below). It runs, in order:
 
 1. **Build the batch.** For each mutation, if the key parses as
    `collection:id` and that collection has indexes, the old document is loaded
+   (ignoring its expiry, so an expired document's postings are removed too)
    and `IndexManager.buildIndexOps` produces the posting deletes and inserts.
-   The value operation is appended to the same list.
+   The value operation is appended to the same list. A TTL reclamation
+   re-reads its key here and is skipped if the key was rewritten since it
+   was seen expired.
 2. **`StorageEngine.writeBatch(ops)` — the durability point.** The WAL append
    inside it returns only when the batch is durable per the sync mode. The
    batch is atomic: after a crash either all of it or none of it is visible,
@@ -122,22 +144,18 @@ mutates storage on behalf of a user write. It runs, in order:
    default pushes the WAL to the OS or fsyncs it here.
 4. **Cache.** Only now. The cache stores the plaintext record envelope — never
    ciphertext, and never before durability, so a failed write cannot leave a
-   phantom entry.
+   phantom entry. A `get` whose storage read overlapped a write of the same
+   key does not fill the cache, so it can never put back an older value.
 5. **Events.** `ChangeStreamHub.publish` for every mutation.
 
 ### Transactions and index maintenance
 
-The transaction manager owns the atomic batch for a transaction's values.
-After `commit` returns a `CommitResult`, the database walks its
-`AppliedOperation` list and performs index maintenance, cache invalidation and
-event publication.
-
-**Limit:** index postings for transactional writes are written in a second
-batch that follows the commit. If the process dies between the two, the
-documents are durable but their index postings for that transaction are not.
-Rebuild with `dropIndex` + `createIndex` if you need to recover from that. For
-writes where index durability must be atomic with the document, use `put` /
-`putBatch`, which put both in one batch.
+A commit runs inside the pipeline's lock. Validation, the transaction's
+values and their index postings form one atomic `writeBatch`, then the cache
+and change events are updated, all before any other write can run. A crash
+can therefore never leave a committed document without its postings, and a
+plain `put` can never interleave with a commit and leave the cache or an
+index disagreeing with storage.
 
 ## Key space and the reserved 0x00 prefix
 
@@ -198,22 +216,48 @@ null < false < true < numbers < strings < lists < maps < other
 ```
 
 `int` and `double` share one numeric space, so `whereEquals('n', 5)` matches
-`5.0`. Strings order by UTF-8 bytes, lists compare element-wise, maps compare
-by sorted key/value pairs, and anything else compares by `toString()`. The
-comparator is defined as `memcmp` of the index encodings, so the indexed path
-and the scan path cannot disagree.
+`5.0`, and `-0.0` equals `0`. Strings order by UTF-8 bytes, lists compare
+element-wise, maps compare by sorted key/value pairs, and anything else
+compares by `toString()`. The comparator is `memcmp` of the index encodings,
+refined for large integers (below), so the indexed path and the scan path
+agree.
 
-**Limit:** integers with magnitude above 2^53 lose precision inside the
-unified numeric space. Because query results are always re-filtered against
-the loaded documents, this can only widen an index range scan, never produce a
-wrong result.
+Integers with magnitude above 2^53 share a double encoding with their
+neighbours. Comparisons break such ties exactly (2^53 + 1 is greater than
+2^53), and the index planner scans an inexact bound inclusively, so the index
+returns a superset and the exact re-filter of loaded documents decides.
+
+Comparisons across types follow the total order: `whereGreaterThan('age', 5)`
+matches a document whose `age` is the string `'old'` (strings sort after
+numbers), and `whereLessThan('age', 50)` matches documents with no `age` (null
+sorts first). Add a type condition if your data mixes types.
+
+Without `orderBy`, the order of results, and therefore which documents a
+`limit` returns, depends on whether an index served the query. Add `orderBy`
+when it matters.
+
+Collection names must not contain `:`, because document keys are
+`collection:id` and are split at the first `:`. `query`, `collection` and
+`createIndex` reject such names with `QueryException`.
 
 `IndexManager.candidateIds` returns `null` when no index can serve any
 condition (the caller scans) and an empty set when an index was consulted and
-nothing matched. Those two cases are never conflated.
+nothing matched. Those two cases are never conflated. Candidates are
+streamed, so a `limit` without `orderBy` (and `findOne`) stops the index scan
+as soon as enough documents matched.
+
+`count()` without conditions iterates keys only. With conditions it loads and
+checks every candidate document.
 
 Compound indexes are used for an equality prefix plus one trailing range or
 `whereIn` component, in field order.
+
+Secondary index changes follow the same rules: `createIndex` registers the
+index under the pipeline lock and backfills in chunks, re-reading every
+document under the lock so a document changed during the backfill is indexed
+by its current version. `dropIndex` removes the index metadata first, so a
+crash midway leaves only orphaned postings (cleared by the next
+`createIndex` of that index), never an index that reloads incomplete.
 
 ## Encryption
 
@@ -231,8 +275,17 @@ See the envelope layout in the README. Additional details:
   Tests may pass a low count explicitly; production code should not.
 - The salt is per database, generated with `Random.secure()` on first open and
   stored in `reaxdb.meta` together with the iteration count.
-- Only values are encrypted. Keys, index postings and the header are
-  plaintext.
+- Every value is authenticated together with its key (GCM associated data),
+  so a ciphertext moved to another key fails to decrypt. Envelopes written
+  by 2.0.0 (version 0x01, without associated data) are still read.
+- The header stores a key check derived from the key, so a wrong key or
+  passphrase is rejected at `open`. A 2.0.0 database gets one on its first
+  open by 2.1, after the key has been proven against a stored value.
+- PBKDF2 runs on a background isolate (`Isolate.run`); at 210,000 iterations
+  it takes about 1.5 s in an AOT build on an Apple M-series machine, more on
+  phones, once per open.
+- Only values are encrypted. Keys, index postings (which contain the indexed
+  field values) and the header are plaintext.
 
 `db.encryptionInfo` reports the **effective** algorithm, never a requested one.
 
@@ -248,12 +301,13 @@ final db = await ReaxDB.open(
 );
 ```
 
-`ReaxLogger.root` (also exported as the top-level `logger`) remains available
-for code not tied to a database. `db.close()` closes the database's logger and
+`ReaxLogger.root` remains available for code not tied to a database. The
+top-level `logger` alias is deprecated, because it collides with
+`package:logger`. `db.close()` closes the database's logger and
 the outputs it owns.
 
-File logging lives behind a separate entry point so the main barrel stays free
-of it:
+File logging lives behind a separate entry point, so the main barrel's
+surface stays small:
 
 ```dart
 import 'package:reaxdb_dart/reaxdb_dart_io.dart';
@@ -275,13 +329,18 @@ Redaction.key('user:ada@example.com');  // key#3f2a9c1d(len=21)
 Redaction.value({'a': 1});              // <redacted Map, 1 entries>
 ```
 
+The key fingerprint is an HMAC-SHA256 under a random key chosen per isolate,
+so the same key gives the same fingerprint within one run (log lines stay
+correlatable), but a fingerprint cannot be reversed by hashing guesses such
+as email addresses or phone numbers.
+
 `ReaxEntry.toString()` and `DatabaseChangeEvent.toString()` are redacted the
 same way, because those objects routinely end up in log lines and exception
 messages.
 
 ## Concurrency model
 
-ReaxDB is single-isolate. Within an isolate:
+A database is used from one isolate at a time. Within that isolate:
 
 - The storage engine serializes every mutation, flush, compaction and close.
 - The transaction manager serializes commits behind one mutex.
@@ -290,8 +349,15 @@ ReaxDB is single-isolate. Within an isolate:
 - The database facade serializes pipeline writes against export, flush,
   compaction and close.
 
-Concurrent `await`ed calls from the same isolate are safe. Two isolates or two
-processes must not open the same directory; the advisory lock enforces that.
+Concurrent `await`ed calls from the same isolate are safe. A second open of
+an open database fails with `DatabaseLockedException`, whether it comes from
+another process, another isolate of this process, or a symlinked or
+differently cased path in this isolate: the lock is a `flock` on
+`<path>/LOCK` (through `dart:ffi`), which belongs to one open file, not to
+the whole process. On Windows the `dart:io` lock gives the same guarantee. If
+an isolate that holds a database dies without closing it, the lock is
+released when that isolate's memory is reclaimed; close databases
+explicitly.
 
 ## Operational notes
 
@@ -321,6 +387,22 @@ is a reasonable starting point for mobile.
 ### Backups
 
 `exportTo` blocks writes for the duration of the scan. On a large database
-schedule it when the application is idle. The archive is a single file with a
-verified SHA-256 digest; keep the digest failure path in mind when restoring
-from cold storage.
+schedule it when the application is idle. The archive is a single streamed
+file with a verified SHA-256 digest, written to a temporary file and renamed
+into place. It is plaintext unless you pass `encryption:`; it is created with
+the process's default file permissions, so keep it somewhere only your app
+can read.
+
+`importFrom` verifies the digest over the whole file first, restores in
+batches into a temporary sibling directory, recreates the indexes and only
+then moves the result into place. Archives written by 2.0 (format version 1)
+are still restored.
+
+### Disk full and other I/O failures
+
+A failed write (for example `ENOSPC`) throws `StorageException` and is not
+applied: the write-ahead log is rolled back to the last complete record, so
+the database stays readable and later writes succeed once space is free. A
+failure in background maintenance after a write is already durable (flushing
+the memtable, compaction) does not fail that write; it is logged and retried
+on a later write.

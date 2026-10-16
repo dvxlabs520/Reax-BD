@@ -24,14 +24,19 @@
 /// Values of any type compare under one documented total order:
 /// `null < false < true < numbers < strings < lists < maps < other`.
 /// Numbers form a single space: `int` and `double` with the same numeric
-/// value encode identically, so `whereEquals(field, 5)` matches `5.0`.
-/// Integers with magnitude above 2^53 lose precision in this unified space;
-/// queries re-filter loaded documents, so this can only widen an index range,
-/// never produce wrong results. Strings order by UTF-8 bytes; lists compare
-/// element-wise; maps compare by sorted key/value pairs; any other type
-/// compares by its `toString()`. [compareValues] and the byte encoding agree
-/// exactly: the comparator is defined as memcmp of the encodings, so the
-/// index path and the scan path can never disagree.
+/// value encode identically, so `whereEquals(field, 5)` matches `5.0`, and
+/// `-0.0` is the same value as `0`.
+///
+/// The byte encoding stores numbers as doubles, so integers with magnitude
+/// above 2^53 can share an encoding with their neighbours. [compareValues]
+/// therefore compares numbers EXACTLY (2^53 + 1 is greater than 2^53), and
+/// the index planner widens any bound that is not exactly representable, so
+/// the index only ever returns a superset of the matches and the exact
+/// re-filter of loaded documents decides. Strings order by UTF-8 bytes;
+/// lists compare element-wise; maps compare by sorted key/value pairs; any
+/// other type compares by its `toString()`. Apart from that refinement of
+/// large integers, [compareValues] is the memcmp of the encodings, so the
+/// index path and the scan path agree.
 library;
 
 import 'dart:convert';
@@ -118,6 +123,24 @@ final class IndexDefinition {
   String toString() => 'IndexDefinition($name)';
 }
 
+/// Throws [QueryException] unless [collection] can name a collection.
+///
+/// Document keys have the shape `collection:id` and are split at the FIRST
+/// `:`, so a collection name containing `:` would be read back as a
+/// different, shorter collection: its documents would silently miss index
+/// maintenance. Such names are rejected instead.
+void validateCollectionName(String collection) {
+  if (collection.isEmpty) {
+    throw const QueryException('Collection name must not be empty');
+  }
+  if (collection.contains(':') || collection.contains('\u0000')) {
+    throw QueryException(
+      'Collection name "$collection" must not contain ":" or NUL: document '
+      'keys are "collection:id" and are split at the first ":"',
+    );
+  }
+}
+
 /// Reads the value at dotted [path] from [document].
 ///
 /// Returns null when any segment is missing or a non-map is traversed. Both
@@ -195,7 +218,9 @@ final class IndexValueCodec {
       out.addByte(value ? tagTrue : tagFalse);
     } else if (value is num) {
       out.addByte(tagNumber);
-      out.add(_encodeNumber(value.toDouble()));
+      final double number = value.toDouble();
+      // -0.0 and 0.0 are one value; NaN keeps its own (largest) slot.
+      out.add(_encodeNumber(number == 0 ? 0.0 : number));
     } else if (value is String) {
       out.addByte(tagString);
       _writeEscaped(out, utf8.encode(value));
@@ -357,11 +382,63 @@ final class IndexValueCodec {
 /// comparator and the on-disk index ordering can never diverge.
 int compareValues(dynamic a, dynamic b) {
   if (identical(a, b)) return 0;
-  return compareBytes(
+  final int encoded = compareBytes(
     IndexValueCodec.encodeValue(a),
     IndexValueCodec.encodeValue(b),
   );
+  if (encoded != 0) return encoded;
+  // Equal encodings are equal values, except for integers beyond 2^53
+  // that round to the same double; break those ties exactly, inside lists
+  // and maps too.
+  return _compareExactTies(a, b);
 }
+
+int _compareExactTies(dynamic a, dynamic b) {
+  if (a is num && b is num) return _compareNumbersExactly(a, b);
+  if (a is List && b is List) {
+    for (int i = 0; i < a.length && i < b.length; i++) {
+      final int c = _compareExactTies(a[i], b[i]);
+      if (c != 0) return c;
+    }
+    return 0;
+  }
+  if (a is Map && b is Map) {
+    final List<String> keys = a.keys.map((dynamic k) => k.toString()).toList()
+      ..sort();
+    for (final String key in keys) {
+      final int c = _compareExactTies(a[key], b[key]);
+      if (c != 0) return c;
+    }
+  }
+  return 0;
+}
+
+/// Compares two numbers whose double encodings are equal, exactly.
+int _compareNumbersExactly(num a, num b) {
+  if (a is int && b is int) return a.compareTo(b);
+  if (a is double && b is double) return 0;
+  // One int, one double with the same rounded value: the double is
+  // integral and finite, so the comparison is exact in BigInt.
+  final double d = (a is double ? a : b) as double;
+  if (!d.isFinite) return 0;
+  final BigInt asBig = BigInt.from(d);
+  final int c = a is int
+      ? BigInt.from(a).compareTo(asBig)
+      : asBig.compareTo(BigInt.from(b as int));
+  return c;
+}
+
+/// Whether the index encoding of [value] is exact, so a bound on it can be
+/// used as written. Integers of magnitude 2^53 and above are not: 2^53
+/// itself is representable, but 2^53 + 1 encodes the same.
+bool isExactlyEncodable(dynamic value) {
+  if (value is int) return value.abs() < _maxExactInt;
+  if (value is List) return value.every(isExactlyEncodable);
+  if (value is Map) return value.values.every(isExactlyEncodable);
+  return true;
+}
+
+const int _maxExactInt = 9007199254740992; // 2^53
 
 /// Returns true when [a] and [b] are equal under the index total order
 /// (structural equality for lists/maps, `5 == 5.0` for numbers).

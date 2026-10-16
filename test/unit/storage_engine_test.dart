@@ -159,8 +159,10 @@ void main() {
       await engine.flush();
       await engine.put(_b('a'), _b('1'));
       await engine.put(_b('c'), _b('3'));
-      final keys =
-          await engine.scan().map((kv) => utf8.decode(kv.key)).toList();
+      final keys = await engine
+          .scan()
+          .map((kv) => utf8.decode(kv.key))
+          .toList();
       expect(keys, ['a', 'b', 'c', 'd']);
       await engine.close();
     });
@@ -170,8 +172,10 @@ void main() {
       await engine.put(_b('k'), _b('old'));
       await engine.flush();
       await engine.put(_b('k'), _b('new'));
-      final values =
-          await engine.scan().map((kv) => utf8.decode(kv.value)).toList();
+      final values = await engine
+          .scan()
+          .map((kv) => utf8.decode(kv.value))
+          .toList();
       expect(values, ['new']);
       await engine.close();
     });
@@ -182,8 +186,10 @@ void main() {
       await engine.put(_b('b'), _b('2'));
       await engine.flush();
       await engine.delete(_b('a'));
-      final keys =
-          await engine.scan().map((kv) => utf8.decode(kv.key)).toList();
+      final keys = await engine
+          .scan()
+          .map((kv) => utf8.decode(kv.key))
+          .toList();
       expect(keys, ['b']);
       await engine.close();
     });
@@ -194,11 +200,10 @@ void main() {
         await engine.put(_b(k), _b('v$k'));
       }
       await engine.flush();
-      final keys =
-          await engine
-              .scan(startKey: _b('b'), endKey: _b('e'))
-              .map((kv) => utf8.decode(kv.key))
-              .toList();
+      final keys = await engine
+          .scan(startKey: _b('b'), endKey: _b('e'))
+          .map((kv) => utf8.decode(kv.key))
+          .toList();
       expect(keys, ['b', 'c', 'd']);
       await engine.close();
     });
@@ -210,11 +215,10 @@ void main() {
       }
       await engine.flush();
       await engine.put(_b('bb'), _b('mem'));
-      final keys =
-          await engine
-              .scan(startKey: _b('b'), endKey: _b('e'), reverse: true)
-              .map((kv) => utf8.decode(kv.key))
-              .toList();
+      final keys = await engine
+          .scan(startKey: _b('b'), endKey: _b('e'), reverse: true)
+          .map((kv) => utf8.decode(kv.key))
+          .toList();
       expect(keys, ['d', 'c', 'bb', 'b']);
       await engine.close();
     });
@@ -224,14 +228,15 @@ void main() {
       for (final k in ['a', 'b', 'c', 'd']) {
         await engine.put(_b(k), _b('v$k'));
       }
-      final forward =
-          await engine.scan(limit: 2).map((kv) => utf8.decode(kv.key)).toList();
+      final forward = await engine
+          .scan(limit: 2)
+          .map((kv) => utf8.decode(kv.key))
+          .toList();
       expect(forward, ['a', 'b']);
-      final backward =
-          await engine
-              .scan(limit: 2, reverse: true)
-              .map((kv) => utf8.decode(kv.key))
-              .toList();
+      final backward = await engine
+          .scan(limit: 2, reverse: true)
+          .map((kv) => utf8.decode(kv.key))
+          .toList();
       expect(backward, ['d', 'c']);
       await engine.close();
     });

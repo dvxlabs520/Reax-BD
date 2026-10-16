@@ -66,11 +66,10 @@ Uint8List _u32(int value) =>
 /// The 1.x encoding of a string value: marker 0, length, UTF-8 bytes.
 Uint8List _legacyString(String value) {
   final List<int> bytes = utf8.encode(value);
-  final BytesBuilder out =
-      BytesBuilder()
-        ..add(<int>[0])
-        ..add(_u32(bytes.length))
-        ..add(bytes);
+  final BytesBuilder out = BytesBuilder()
+    ..add(<int>[0])
+    ..add(_u32(bytes.length))
+    ..add(bytes);
   return out.takeBytes();
 }
 
@@ -180,14 +179,12 @@ void main() {
       await db.put('secret', 'value');
       await db.close();
 
-      final ReaxDB reopened = await ReaxDB.open(
-        path: path,
-        // ignore: deprecated_member_use
-        encryptionKey: 'wrong',
-      );
-      addTearDown(reopened.close);
       await expectLater(
-        reopened.get<String>('secret'),
+        ReaxDB.open(
+          path: path,
+          // ignore: deprecated_member_use
+          encryptionKey: 'wrong',
+        ),
         throwsA(isA<EncryptionException>()),
       );
     });

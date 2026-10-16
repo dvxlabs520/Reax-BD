@@ -3,6 +3,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ffi' show Finalizable, Pointer, Void;
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -22,6 +23,7 @@ import 'core/logging/log_level.dart';
 import 'core/logging/log_output.dart';
 import 'core/logging/logger.dart';
 import 'core/logging/redaction.dart';
+import 'core/platform/native_io.dart';
 import 'core/query/document_store.dart';
 import 'core/query/query_builder.dart';
 import 'core/storage/lsm_storage_engine.dart';
@@ -35,6 +37,8 @@ import 'core/wal/write_ahead_log.dart' show SyncMode;
 import 'domain/entities/database_entity.dart';
 import 'legacy/legacy_migrator.dart';
 import 'simple_api.dart';
+
+part 'reaxdb_backup.dart';
 
 /// How [ReaxDB.open] reacts to a ReaxDB 1.x database in the target directory.
 ///
@@ -100,28 +104,18 @@ enum LegacyMigrationMode {
 /// `collection:id` key shape.
 final class ReaxDB {
   ReaxDB._({
-    required String path,
-    required LsmStorageEngine storage,
-    required ReaxCache cache,
-    required TransactionManager transactions,
-    required IndexManager indexes,
-    required EncryptionEngine encryption,
-    required ChangeStreamHub hub,
-    required ReaxLogger logger,
-    required SyncMode syncMode,
-    required RandomAccessFile lockFile,
-    required _DatabaseHeader header,
-  }) : _path = path,
-       _storage = storage,
-       _cache = cache,
-       _transactions = transactions,
-       _indexes = indexes,
-       _encryption = encryption,
-       _hub = hub,
-       _logger = logger,
-       _syncMode = syncMode,
-       _lockFile = lockFile,
-       _header = header;
+    required this._path,
+    required this._storage,
+    required this._cache,
+    required this._transactions,
+    required this._indexes,
+    required this._encryption,
+    required this._hub,
+    required this._logger,
+    required this._syncMode,
+    required this._lockFile,
+    required this._header,
+  });
 
   /// Instances open in this isolate, keyed by canonical directory path.
   static final Map<String, ReaxDB> _instances = <String, ReaxDB>{};
@@ -141,11 +135,12 @@ final class ReaxDB {
   final ChangeStreamHub _hub;
   final ReaxLogger _logger;
   final SyncMode _syncMode;
-  final RandomAccessFile _lockFile;
+  final _DatabaseLock _lockFile;
 
   _DatabaseHeader _header;
   bool _closed = false;
   bool _closing = false;
+  Future<void>? _closeFuture;
 
   /// Serializes pipeline writes against snapshot operations (export,
   /// compaction, flush, close) so a snapshot scan can never race a
@@ -154,6 +149,11 @@ final class ReaxDB {
 
   /// Futures for work accepted but not yet finished, drained by [close].
   final Set<Future<void>> _inFlight = <Future<void>>{};
+
+  /// Storage reads in flight per key, and the keys written while one was.
+  /// See [get].
+  final Map<String, int> _pendingReads = <String, int>{};
+  final Set<String> _dirtyReads = <String>{};
 
   late final DocumentStore _documentStore = _FacadeDocumentStore(this);
 
@@ -207,6 +207,7 @@ final class ReaxDB {
     int cacheMaxEntries = 10000,
     int cacheMaxMemoryBytes = 64 * 1024 * 1024,
     Duration? cacheDefaultTtl,
+    int changeStreamBufferSize = ChangeStreamHub.defaultMaxBufferedEvents,
     LogLevel logLevel = LogLevel.warning,
     List<LogOutput>? logOutputs,
     String? loggerName,
@@ -227,7 +228,7 @@ final class ReaxDB {
       'or EncryptionConfig.aes256(key: ...). Removed in 3.0.',
     )
     String? encryptionKey,
-  }) async {
+  }) => _guardIo(path, () async {
     if (schemaVersion < 1) {
       throw SchemaVersionException(
         'schemaVersion must be at least 1 (got $schemaVersion)',
@@ -248,10 +249,9 @@ final class ReaxDB {
     final int effectiveCacheMaxEntries =
         tuning.cacheMaxEntries ?? cacheMaxEntries;
 
-    final Directory directory = Directory(path);
-    await directory.create(recursive: true);
     final String canonical = _canonicalize(path);
-
+    // Checked before the first await, so a second open issued while the
+    // first is still open fails even if the first is being closed.
     if (_instances.containsKey(canonical)) {
       throw DatabaseLockedException(
         'Database at "$canonical" is already open in this isolate. Close the '
@@ -259,6 +259,11 @@ final class ReaxDB {
         path: canonical,
       );
     }
+    // Finish (or discard) a 1.x migration a crash interrupted, before the
+    // directory is created: an interrupted swap can leave the path missing.
+    await LegacyMigration.recoverInterrupted(canonical);
+    final Directory directory = Directory(path);
+    await directory.create(recursive: true);
 
     // The 1.x check runs before the lock is taken because an automatic
     // migration opens a 2.0 database at this very path through the public
@@ -270,7 +275,7 @@ final class ReaxDB {
       encryption: effectiveEncryption,
     );
 
-    final RandomAccessFile lockFile = await _acquireLock(canonical);
+    final _DatabaseLock lockFile = await _DatabaseLock.acquire(canonical);
     ReaxLogger? logger;
     LsmStorageEngine? storage;
     try {
@@ -280,22 +285,62 @@ final class ReaxDB {
         name: loggerName ?? p.basename(canonical),
       );
 
-      final _DatabaseHeader header = await _DatabaseHeader.load(
+      _DatabaseHeader header = await _DatabaseHeader.load(
         canonical,
         effectiveEncryption,
         schemaVersion,
       );
 
-      final EncryptionEngine engine = EncryptionEngine(
+      // PBKDF2 runs on a background isolate: hundreds of milliseconds to
+      // seconds of key derivation must not freeze a Flutter UI.
+      final EncryptionEngine engine = await EncryptionEngine.create(
         effectiveEncryption,
         kdfSalt: header.kdfSalt,
       );
+      final Uint8List? keyCheck = header.keyCheck;
+      if (keyCheck != null && !engine.verifyKeyCheck(keyCheck)) {
+        throw _wrongKey(canonical);
+      }
 
+      final ReaxLogger databaseLogger = logger;
       storage = await LsmStorageEngine.open(
         directory: canonical,
         syncMode: effectiveSyncMode,
         memtableSizeBytes: effectiveMemtableSizeBytes,
+        // A flush or compaction that fails after a write is already durable
+        // does not fail that write; it is retried and reported here.
+        onMaintenanceError: (Object error, StackTrace stack) {
+          unawaited(
+            databaseLogger.error(
+              'Background flush or compaction failed and will be retried',
+              error: error,
+              stackTrace: stack,
+            ),
+          );
+        },
       );
+
+      if (keyCheck == null && engine.type != EncryptionType.none) {
+        // A 2.0.0 database has no key check yet: prove the key against a
+        // stored value before writing one, so a wrong key can never be
+        // recorded as the right one.
+        await for (final KeyValue pair in storage.scan(
+          startKey: _userKeySpaceStart,
+          limit: 1,
+        )) {
+          try {
+            // Decoding catches a wrong obfuscation key too: XOR has no
+            // authentication tag, but garbage is not a record envelope.
+            RecordEnvelope.decode(
+              engine.decrypt(pair.value, associatedData: pair.key),
+            );
+          } on ReaxDbException {
+            throw _wrongKey(canonical);
+          }
+        }
+        header = header.withKeyCheck(engine.createKeyCheck());
+        await header.save(canonical);
+      }
 
       final ReaxCache cache = ReaxCache(
         maxEntries: effectiveCacheMaxEntries,
@@ -303,6 +348,7 @@ final class ReaxDB {
         defaultTtl: cacheDefaultTtl,
       );
 
+      final _FacadeCommitPipeline pipeline = _FacadeCommitPipeline();
       final ReaxDB db = ReaxDB._(
         path: canonical,
         storage: storage,
@@ -311,20 +357,23 @@ final class ReaxDB {
           storageEngine: storage,
           defaultIsolationLevel: defaultIsolationLevel,
           lockTimeout: lockTimeout,
+          pipeline: pipeline,
         ),
         indexes: IndexManager(
           storage: storage,
-          decodeDocument:
-              (Uint8List bytes) => _decodeStoredDocument(bytes, engine),
+          decodeDocument: (Uint8List key, Uint8List bytes) =>
+              _decodeDocumentWith(engine, bytes, key),
+          exclusive: pipeline.exclusive,
         ),
         encryption: engine,
-        hub: ChangeStreamHub(),
+        hub: ChangeStreamHub(maxBufferedEvents: changeStreamBufferSize),
         logger: logger,
         syncMode: effectiveSyncMode,
         lockFile: lockFile,
         header: header,
       );
 
+      pipeline.attach(db);
       await db._indexes.loadIndexes();
       _instances[canonical] = db;
 
@@ -340,9 +389,56 @@ final class ReaxDB {
       await storage?.close();
       await logger?.close();
       _instances.remove(canonical);
-      await _releaseLock(lockFile);
+      await lockFile.release();
       rethrow;
     }
+  });
+
+  static EncryptionException _wrongKey(String canonical) => EncryptionException(
+    'Wrong encryption key or passphrase for the database at "$canonical". '
+    'Nothing was read or written with it.',
+  );
+
+  /// Runs [action], turning a raw `FileSystemException` into a
+  /// [StorageException] so every failure stays a [ReaxDbException].
+  static Future<T> _guardIo<T>(
+    String? path,
+    Future<T> Function() action,
+  ) async {
+    try {
+      return await action();
+    } on FileSystemException catch (error) {
+      throw _storageError(error, path);
+    }
+  }
+
+  /// Stream form of [_guardIo].
+  static Stream<T> _guardIoStream<T>(String? path, Stream<T> source) =>
+      source.handleError(
+        (Object error) =>
+            throw _storageError(error as FileSystemException, path),
+        test: (dynamic error) => error is FileSystemException,
+      );
+
+  static StorageException _storageError(
+    FileSystemException error,
+    String? path,
+  ) {
+    final String target = error.path ?? path ?? '';
+    final bool relativeOnMobile =
+        path != null &&
+        !p.isAbsolute(path) &&
+        (Platform.isIOS || Platform.isAndroid);
+    return StorageException(
+      '${error.message}${target.isEmpty ? '' : ' ("$target")'}'
+      '${error.osError == null ? '' : ': ${error.osError!.message}'}'
+      '${relativeOnMobile ? '. "$path" is a relative path, which iOS and '
+                'Android resolve against a read-only directory: pass an '
+                'absolute path, for example a subdirectory of '
+                'getApplicationSupportDirectory() from path_provider' : ''}',
+      path: target.isEmpty ? null : target,
+      cause: error,
+    );
   }
 
   // -- ReaxDB 1.x migration ------------------------------------------------
@@ -387,8 +483,8 @@ final class ReaxDB {
       '       ReaxDB.open(path: "${legacy.path}", legacyMigration: '
       'LegacyMigrationMode.automatic)\n'
       '${legacy.looksEncrypted ? '  Because the 1.x database is encrypted, '
-              'also pass the ORIGINAL 1.x key as legacyEncryptionKey: "..." '
-              'and the NEW configuration in encryption:.\n' : ''}'
+                'also pass the ORIGINAL 1.x key as legacyEncryptionKey: "..." '
+                'and the NEW configuration in encryption:.\n' : ''}'
       '  3. Or ignore the 1.x files and start empty at this path:\n'
       '       ReaxDB.open(path: "${legacy.path}", legacyMigration: '
       'LegacyMigrationMode.off)\n'
@@ -402,7 +498,7 @@ final class ReaxDB {
       '${report.tombstonesApplied} tombstones applied in '
       '${report.elapsed.inMilliseconds}ms. Backup: ${report.backupPath}.'
       '${report.warnings.isEmpty ? '' : ' Warnings: '
-              '${report.warnings.join('; ')}'}';
+                '${report.warnings.join('; ')}'}';
 
   /// Migrates the ReaxDB 1.x database at [sourcePath] into a 2.0 database.
   ///
@@ -647,21 +743,41 @@ final class ReaxDB {
     return bytes;
   }
 
-  /// Decodes stored bytes into the plaintext record envelope.
-  Uint8List _toEnvelope(Uint8List stored) => _encryption.decrypt(stored);
+  /// Decodes the stored bytes of [keyBytes] into the plaintext record
+  /// envelope.
+  Uint8List _toEnvelope(Uint8List stored, Uint8List keyBytes) =>
+      _decryptStored(_encryption, stored, keyBytes);
 
-  /// Encrypts a plaintext record envelope for storage.
-  Uint8List _toStored(Uint8List envelope) => _encryption.encrypt(envelope);
+  /// Encrypts the plaintext record envelope of [keyBytes] for storage.
+  Uint8List _toStored(Uint8List envelope, Uint8List keyBytes) =>
+      _encryption.encrypt(envelope, associatedData: keyBytes);
 
-  static Map<String, dynamic>? _decodeStoredDocument(
-    Uint8List stored,
+  static Uint8List _decryptStored(
     EncryptionEngine encryption,
+    Uint8List stored,
+    Uint8List keyBytes,
+  ) => encryption.decrypt(stored, associatedData: keyBytes);
+
+  Map<String, dynamic>? _decodeStoredDocument(
+    Uint8List stored,
+    Uint8List keyBytes,
+  ) => _decodeDocumentWith(_encryption, stored, keyBytes);
+
+  /// Decodes a stored document IGNORING its expiry.
+  ///
+  /// Index postings mirror what is stored, expired or not: an expired
+  /// document keeps its postings until it is reclaimed through the write
+  /// pipeline, which then removes them. Queries never return expired
+  /// documents because they load every candidate through [get].
+  static Map<String, dynamic>? _decodeDocumentWith(
+    EncryptionEngine encryption,
+    Uint8List stored,
+    Uint8List keyBytes,
   ) {
     try {
       final StoredRecord record = RecordEnvelope.decode(
-        encryption.decrypt(stored),
+        _decryptStored(encryption, stored, keyBytes),
       );
-      if (record.isExpiredAt(DateTime.now())) return null;
       final Object? value = record.value;
       return value is Map<String, dynamic> ? value : null;
     } on ReaxDbException {
@@ -689,17 +805,41 @@ final class ReaxDB {
       _cache.remove(key);
     }
 
-    final Uint8List? stored = await _storage.get(keyBytes);
-    if (stored == null) return null;
+    // A write that lands while this read is in flight marks the key dirty,
+    // and a dirty read never fills the cache: otherwise an older value read
+    // here could overwrite the newer one the write just cached.
+    _pendingReads[key] = (_pendingReads[key] ?? 0) + 1;
+    try {
+      final Uint8List? stored = await _guardIo(
+        _path,
+        () => _storage.get(keyBytes),
+      );
+      if (stored == null) return null;
 
-    final Uint8List envelope = _toEnvelope(stored);
-    final StoredRecord record = RecordEnvelope.decode(envelope);
-    if (record.isExpiredAt(now)) {
-      await _reclaimExpired(<String>[key]);
-      return null;
+      final Uint8List envelope = _toEnvelope(stored, keyBytes);
+      final StoredRecord record = RecordEnvelope.decode(envelope);
+      if (record.isExpiredAt(now)) {
+        await _reclaimExpired(<String>[key]);
+        return null;
+      }
+      if (!_dirtyReads.contains(key)) {
+        _cache.put(key, envelope, expiresAt: record.expiresAt);
+      }
+      return _cast<T>(key, record.value);
+    } finally {
+      final int remaining = _pendingReads[key]! - 1;
+      if (remaining == 0) {
+        _pendingReads.remove(key);
+        _dirtyReads.remove(key);
+      } else {
+        _pendingReads[key] = remaining;
+      }
     }
-    _cache.put(key, envelope, expiresAt: record.expiresAt);
-    return _cast<T>(key, record.value);
+  }
+
+  /// Marks [key] as written for reads that are in flight on it.
+  void _markWritten(String key) {
+    if (_pendingReads.containsKey(key)) _dirtyReads.add(key);
   }
 
   /// Reads several keys, returning null for those absent or expired.
@@ -715,9 +855,16 @@ final class ReaxDB {
   /// Whether a live (non-expired) entry exists for [key].
   Future<bool> exists(String key) async {
     _ensureOpen();
-    final Uint8List? stored = await _storage.get(encodeKey(key));
+    final Uint8List keyBytes = encodeKey(key);
+    final Uint8List? stored = await _guardIo(
+      _path,
+      () => _storage.get(keyBytes),
+    );
     if (stored == null) return false;
-    return !RecordEnvelope.isExpired(_toEnvelope(stored), DateTime.now());
+    return !RecordEnvelope.isExpired(
+      _toEnvelope(stored, keyBytes),
+      DateTime.now(),
+    );
   }
 
   static T? _cast<T>(String key, Object? value) {
@@ -776,18 +923,21 @@ final class ReaxDB {
     bool reverse = false,
   }) async* {
     _ensureOpen();
-    final Uint8List start =
-        prefix == null ? _userKeySpaceStart : encodeKey(prefix);
-    final Uint8List? end =
-        prefix == null ? null : IndexKeyCodec.prefixUpperBound(start);
+    final Uint8List start = prefix == null
+        ? _userKeySpaceStart
+        : encodeKey(prefix);
+    final Uint8List? end = prefix == null
+        ? null
+        : IndexKeyCodec.prefixUpperBound(start);
     final DateTime now = DateTime.now();
     int yielded = 0;
-    await for (final KeyValue pair in _storage.scan(
-      startKey: start,
-      endKey: end,
-      reverse: reverse,
+    await for (final KeyValue pair in _guardIoStream(
+      _path,
+      _storage.scan(startKey: start, endKey: end, reverse: reverse),
     )) {
-      if (RecordEnvelope.isExpired(_toEnvelope(pair.value), now)) continue;
+      if (RecordEnvelope.isExpired(_toEnvelope(pair.value, pair.key), now)) {
+        continue;
+      }
       if (limit != null && yielded >= limit) return;
       yielded++;
       yield utf8.decode(pair.key);
@@ -800,13 +950,12 @@ final class ReaxDB {
     String endKey, {
     int? limit,
     bool reverse = false,
-  }) =>
-      scan<T>(
-        startKey: startKey,
-        endKey: endKey,
-        limit: limit,
-        reverse: reverse,
-      ).toList();
+  }) => scan<T>(
+    startKey: startKey,
+    endKey: endKey,
+    limit: limit,
+    reverse: reverse,
+  ).toList();
 
   /// First byte of the user key space; everything below it is reserved.
   static final Uint8List _userKeySpaceStart = Uint8List.fromList(const <int>[
@@ -821,12 +970,11 @@ final class ReaxDB {
   ) async* {
     final DateTime now = DateTime.now();
     int yielded = 0;
-    await for (final KeyValue pair in _storage.scan(
-      startKey: start,
-      endKey: end,
-      reverse: reverse,
+    await for (final KeyValue pair in _guardIoStream(
+      _path,
+      _storage.scan(startKey: start, endKey: end, reverse: reverse),
     )) {
-      final Uint8List envelope = _toEnvelope(pair.value);
+      final Uint8List envelope = _toEnvelope(pair.value, pair.key);
       final StoredRecord record = RecordEnvelope.decode(envelope);
       if (record.isExpiredAt(now)) continue;
       if (limit != null && yielded >= limit) return;
@@ -845,41 +993,67 @@ final class ReaxDB {
   /// The one place that mutates storage on behalf of a user write.
   ///
   /// See the class dartdoc for the ordering invariant this method enforces.
-  Future<void> _applyMutations(
+  ///
+  /// Returns how many mutations were applied (a TTL reclamation whose key
+  /// was rewritten in the meantime is skipped).
+  Future<int> _applyMutations(
     List<_Mutation> mutations, {
     SyncMode? sync,
   }) async {
-    if (mutations.isEmpty) return;
-    await _ioMutex.run(() async {
+    if (mutations.isEmpty) return 0;
+    return _ioMutex.run(() async {
       final List<WriteOp> ops = <WriteOp>[];
+      final List<_Mutation> applied = <_Mutation>[];
+      final DateTime now = DateTime.now();
 
       // 1. Build the batch: value ops plus secondary index maintenance.
       for (final _Mutation mutation in mutations) {
         final Uint8List keyBytes = encodeKey(mutation.key);
         final _DocumentAddress? address = _DocumentAddress.parse(mutation.key);
-        if (address != null &&
-            _indexes.listIndexes(address.collection).isNotEmpty) {
+        final bool indexed =
+            address != null &&
+            _indexes.listIndexes(address.collection).isNotEmpty;
+        final Uint8List? stored = indexed || mutation.onlyIfExpired
+            ? await _storage.get(keyBytes)
+            : null;
+
+        if (mutation.onlyIfExpired) {
+          // TTL reclamation re-checks under the pipeline lock: a fresh value
+          // written since the expired one was observed must survive.
+          if (stored == null ||
+              !RecordEnvelope.isExpired(_toEnvelope(stored, keyBytes), now)) {
+            continue;
+          }
+        }
+
+        if (indexed) {
           ops.addAll(
             await _indexes.buildIndexOps(
               collection: address.collection,
               docId: address.id,
-              oldDoc: await _loadDocument(keyBytes),
-              newDoc:
-                  mutation.value is Map<String, dynamic>
-                      ? mutation.value as Map<String, dynamic>
-                      : null,
+              oldDoc: stored == null
+                  ? null
+                  : _decodeStoredDocument(stored, keyBytes),
+              newDoc: mutation.value is Map<String, dynamic>
+                  ? mutation.value as Map<String, dynamic>
+                  : null,
             ),
           );
         }
         ops.add(
           mutation.isDelete
               ? WriteOp.delete(keyBytes)
-              : WriteOp.put(keyBytes, _toStored(mutation.envelope!)),
+              : WriteOp.put(keyBytes, _toStored(mutation.envelope!, keyBytes)),
         );
+        applied.add(mutation);
       }
+      if (applied.isEmpty) return 0;
 
       // 2. Durability point.
-      await _storage.writeBatch(ops);
+      await _guardIo(_path, () => _storage.writeBatch(ops));
+      _transactions.noteExternalWrites(<String>[
+        for (final _Mutation mutation in applied) mutation.key,
+      ]);
 
       // 3. Optional per-write durability escalation.
       if (sync != null && sync.index > _syncMode.index) {
@@ -887,7 +1061,8 @@ final class ReaxDB {
       }
 
       // 4. Cache, only now that the data is durable.
-      for (final _Mutation mutation in mutations) {
+      for (final _Mutation mutation in applied) {
+        _markWritten(mutation.key);
         if (mutation.isDelete) {
           _cache.remove(mutation.key);
         } else {
@@ -900,8 +1075,7 @@ final class ReaxDB {
       }
 
       // 5. Change events, only after the durability point.
-      final DateTime now = DateTime.now();
-      for (final _Mutation mutation in mutations) {
+      for (final _Mutation mutation in applied) {
         _hub.publish(
           DatabaseChangeEvent(
             type: mutation.isDelete ? ChangeType.delete : ChangeType.put,
@@ -911,13 +1085,8 @@ final class ReaxDB {
           ),
         );
       }
+      return applied.length;
     });
-  }
-
-  Future<Map<String, dynamic>?> _loadDocument(Uint8List keyBytes) async {
-    final Uint8List? stored = await _storage.get(keyBytes);
-    if (stored == null) return null;
-    return _decodeStoredDocument(stored, _encryption);
   }
 
   /// Stores [value] under [key].
@@ -985,9 +1154,11 @@ final class ReaxDB {
     return null;
   }
 
-  Future<void> _reclaimExpired(List<String> keys) => _applyMutations(
-    <_Mutation>[for (final String key in keys) _Mutation.delete(key)],
-  );
+  /// Deletes those of [keys] that are STILL expired when the pipeline
+  /// reaches them, returning how many were deleted.
+  Future<int> _reclaimExpired(List<String> keys) => _applyMutations(<_Mutation>[
+    for (final String key in keys) _Mutation.deleteIfExpired(key),
+  ]);
 
   /// Removes every entry whose TTL has elapsed and returns how many were
   /// reclaimed. Expired entries already read as absent; this reclaims their
@@ -1000,104 +1171,127 @@ final class ReaxDB {
       await for (final KeyValue pair in _storage.scan(
         startKey: _userKeySpaceStart,
       )) {
-        if (RecordEnvelope.isExpired(_toEnvelope(pair.value), now)) {
+        if (RecordEnvelope.isExpired(_toEnvelope(pair.value, pair.key), now)) {
           expired.add(utf8.decode(pair.key));
         }
       }
-      await _reclaimExpired(expired);
-      return expired.length;
+      int reclaimed = 0;
+      for (int i = 0; i < expired.length; i += _reclaimBatchSize) {
+        final List<String> chunk = expired.sublist(
+          i,
+          i + _reclaimBatchSize > expired.length
+              ? expired.length
+              : i + _reclaimBatchSize,
+        );
+        reclaimed += await _reclaimExpired(chunk);
+      }
+      return reclaimed;
     });
   }
+
+  static const int _reclaimBatchSize = 500;
 
   // -- transactions -------------------------------------------------------
 
   /// Runs [body] in an ACID transaction, committing on success.
   ///
-  /// The whole write set is applied atomically by the transaction manager.
+  /// The whole write set, together with the secondary index maintenance it
+  /// implies, is applied in ONE atomic batch inside the write pipeline, so a
+  /// crash can never leave a committed document without its index postings,
+  /// and no plain [put] can interleave between validation and the write.
+  /// Cache updates and change events follow the commit before any other
+  /// write runs.
+  ///
   /// Retries on [TransactionConflictException] and [DeadlockException] up to
-  /// [maxAttempts] times; any other error aborts and propagates. After the
-  /// commit succeeds this method runs secondary index maintenance, cache
-  /// invalidation and event publication for every applied operation.
+  /// [maxAttempts] times; any other error aborts and propagates.
+  ///
+  /// The default isolation level is [IsolationLevel.readCommitted], which
+  /// does NOT prevent lost updates: two concurrent read-modify-write
+  /// transactions on the same key can both commit and one increment is
+  /// lost. Use [IsolationLevel.serializable] (or [compareAndSwap]) for
+  /// read-modify-write logic; see `ADVANCED.md`.
   Future<T> transaction<T>(
     Future<T> Function(ReaxTransaction tx) body, {
     IsolationLevel? isolationLevel,
     int maxAttempts = 3,
   }) {
     _ensureOpen();
-    return _track(() async {
-      CommitResult? committed;
-      final T value = await _transactions.runTransaction<T>(
-        (Transaction tx) => body(ReaxTransaction._(this, tx)),
-        isolationLevel: isolationLevel,
-        maxAttempts: maxAttempts,
-        onCommit: (CommitResult result) => committed = result,
-      );
-      final CommitResult? result = committed;
-      if (result != null) await _postCommit(result);
-      return value;
-    });
+    return _track(
+      () => _guardIo(
+        _path,
+        () => _transactions.runTransaction<T>(
+          (Transaction tx) => body(ReaxTransaction._(this, tx)),
+          isolationLevel: isolationLevel,
+          maxAttempts: maxAttempts,
+        ),
+      ),
+    );
   }
 
-  /// Applies post-commit maintenance for a committed transaction.
-  Future<void> _postCommit(CommitResult result) async {
-    if (result.operations.isEmpty) return;
-    await _ioMutex.run(() async {
-      final List<WriteOp> indexOps = <WriteOp>[];
-      final List<DatabaseChangeEvent> events = <DatabaseChangeEvent>[];
-      final DateTime now = DateTime.now();
+  /// Index operations for a transaction's write set, built inside the
+  /// pipeline from the committed values that preceded it.
+  Future<List<WriteOp>> _transactionIndexOps(
+    List<AppliedOperation> applied,
+  ) async {
+    final List<WriteOp> ops = <WriteOp>[];
+    for (final AppliedOperation op in applied) {
+      final _DocumentAddress? address = _DocumentAddress.parse(op.key);
+      if (address == null || _indexes.listIndexes(address.collection).isEmpty) {
+        continue;
+      }
+      final Uint8List keyBytes = encodeKey(op.key);
+      final Uint8List? newBytes = op.newValue;
+      ops.addAll(
+        await _indexes.buildIndexOps(
+          collection: address.collection,
+          docId: address.id,
+          oldDoc: op.oldValue == null
+              ? null
+              : _decodeStoredDocument(op.oldValue!, keyBytes),
+          newDoc: newBytes == null
+              ? null
+              : _decodeStoredDocument(newBytes, keyBytes),
+        ),
+      );
+    }
+    return ops;
+  }
 
-      for (final AppliedOperation op in result.operations) {
-        final _DocumentAddress? address = _DocumentAddress.parse(op.key);
-        final Uint8List? newBytes = op.newValue;
-        final StoredRecord? record =
-            newBytes == null
-                ? null
-                : RecordEnvelope.decode(_toEnvelope(newBytes));
-
-        if (address != null &&
-            _indexes.listIndexes(address.collection).isNotEmpty) {
-          indexOps.addAll(
-            await _indexes.buildIndexOps(
-              collection: address.collection,
-              docId: address.id,
-              oldDoc:
-                  op.oldValue == null
-                      ? null
-                      : _decodeStoredDocument(op.oldValue!, _encryption),
-              newDoc:
-                  record?.value is Map<String, dynamic>
-                      ? record!.value as Map<String, dynamic>
-                      : null,
-            ),
-          );
-        }
-
-        if (record == null) {
-          _cache.remove(op.key);
-        } else {
-          _cache.put(
-            op.key,
-            _toEnvelope(newBytes!),
-            expiresAt: record.expiresAt,
-          );
-        }
+  /// Cache and change-event maintenance for a durable commit. Runs inside
+  /// the write pipeline, before any other write.
+  void _afterTransactionCommit(CommitResult result) {
+    final DateTime now = DateTime.now();
+    final List<DatabaseChangeEvent> events = <DatabaseChangeEvent>[];
+    for (final AppliedOperation op in result.operations) {
+      _markWritten(op.key);
+      final Uint8List? newBytes = op.newValue;
+      if (newBytes == null) {
+        _cache.remove(op.key);
         events.add(
           DatabaseChangeEvent(
-            type: record == null ? ChangeType.delete : ChangeType.put,
+            type: ChangeType.delete,
             key: op.key,
-            value: record?.value,
+            value: null,
             timestamp: now,
           ),
         );
+        continue;
       }
-
-      if (indexOps.isNotEmpty) {
-        await _storage.writeBatch(indexOps);
-      }
-      for (final DatabaseChangeEvent event in events) {
-        _hub.publish(event);
-      }
-    });
+      final Uint8List envelope = _toEnvelope(newBytes, encodeKey(op.key));
+      final StoredRecord record = RecordEnvelope.decode(envelope);
+      _cache.put(op.key, envelope, expiresAt: record.expiresAt);
+      events.add(
+        DatabaseChangeEvent(
+          type: ChangeType.put,
+          key: op.key,
+          value: record.value,
+          timestamp: now,
+        ),
+      );
+    }
+    for (final DatabaseChangeEvent event in events) {
+      _hub.publish(event);
+    }
   }
 
   /// Atomically sets [key] to [newValue] only if it currently holds
@@ -1115,7 +1309,9 @@ final class ReaxDB {
     _ensureOpen();
     return transaction<bool>((ReaxTransaction tx) async {
       final T? current = await tx.get<T>(key);
-      if (current != expectedValue) return false;
+      // Structural comparison: maps and lists read back from storage are
+      // new objects, so identity (`!=`) would never match them.
+      if (!valuesEqual(current, expectedValue)) return false;
       await tx.put(key, newValue, ttl: ttl, expiresAt: expiresAt);
       return true;
     }, isolationLevel: IsolationLevel.serializable);
@@ -1134,6 +1330,7 @@ final class ReaxDB {
     required Map<String, dynamic> Function(T value) toJson,
   }) {
     _ensureOpen();
+    validateCollectionName(name);
     return ReaxCollection<T>(
       name: name,
       db: this,
@@ -1143,8 +1340,11 @@ final class ReaxDB {
   }
 
   /// Returns a query builder over the documents of [collection].
+  ///
+  /// Throws [QueryException] when [collection] is empty or contains `:`.
   QueryBuilder query(String collection) {
     _ensureOpen();
+    validateCollectionName(collection);
     return QueryBuilder(
       collection: collection,
       store: _documentStore,
@@ -1215,14 +1415,14 @@ final class ReaxDB {
   /// Persists the in-memory write buffer to disk and checkpoints the WAL.
   Future<void> flush() {
     _ensureOpen();
-    return _track(() => _ioMutex.run(_storage.flush));
+    return _track(() => _guardIo(_path, () => _ioMutex.run(_storage.flush)));
   }
 
   /// Compacts the on-disk tables, reclaiming space from overwritten and
   /// deleted keys.
   Future<void> compact() {
     _ensureOpen();
-    return _track(() => _ioMutex.run(_storage.compact));
+    return _track(() => _guardIo(_path, () => _ioMutex.run(_storage.compact)));
   }
 
   /// Returns a description of this database.
@@ -1356,237 +1556,78 @@ final class ReaxDB {
   /// Magic header of a ReaxDB export archive: "RXDB".
   static const int archiveMagic = 0x52584442;
 
-  /// Format version of the export archive.
-  static const int archiveVersion = 1;
+  /// Format version of the export archive written by [exportTo].
+  /// [importFrom] also restores version 1 archives written by 2.0.
+  static const int archiveVersion = 2;
 
   /// Writes a consistent snapshot of this database to [archivePath].
   ///
-  /// The archive stores DECRYPTED record envelopes plus the index
-  /// definitions, so a backup taken from an encrypted database can be
-  /// restored into a database with different (or no) encryption. It carries
-  /// a magic number, a format version and a SHA-256 digest of the body,
-  /// verified on import.
+  /// The archive holds every live entry (values decrypted from this
+  /// database's own encryption) and the index definitions, so it can be
+  /// restored into a database with different (or no) encryption. It is
+  /// written to a temporary file and renamed into place, so a crash never
+  /// destroys an earlier backup at the same path, and it ends with a SHA-256
+  /// digest verified on import. Memory use does not grow with the database:
+  /// records are streamed.
+  ///
+  /// **An archive is plaintext unless [encryption] is given.** Pass
+  /// `EncryptionConfig.aes256(...)` or
+  /// `EncryptionConfig.aes256FromPassphrase(...)` to encrypt every record
+  /// (keys included) with AES-256-GCM; [importFrom] then needs the same
+  /// configuration as `archiveEncryption`. The file is created with the
+  /// process's default permissions; keep backups somewhere only your app can
+  /// read.
   ///
   /// Writes are blocked for the duration of the snapshot scan, so the
-  /// archive is a point-in-time image rather than a fuzzy copy.
-  Future<int> exportTo(String archivePath) {
+  /// archive is a point-in-time image rather than a fuzzy copy. Returns the
+  /// number of entries written.
+  Future<int> exportTo(
+    String archivePath, {
+    EncryptionConfig encryption = const EncryptionConfig.none(),
+  }) {
     _ensureOpen();
     return _track(
-      () => _ioMutex.run(() async {
-        final BytesBuilder body = BytesBuilder(copy: false);
-        int entries = 0;
-        await for (final KeyValue pair in _storage.scan(
-          startKey: _userKeySpaceStart,
-        )) {
-          final Uint8List envelope = _toEnvelope(pair.value);
-          Varint.write(body, pair.key.length);
-          body.add(pair.key);
-          Varint.write(body, envelope.length);
-          body.add(envelope);
-          entries++;
-        }
-        final Uint8List bodyBytes = body.takeBytes();
-
-        final Uint8List metadata = Uint8List.fromList(
-          utf8.encode(
-            jsonEncode(<String, dynamic>{
-              'schemaVersion': _header.schemaVersion,
-              'entryCount': entries,
-              'createdAtMs': DateTime.now().millisecondsSinceEpoch,
-              'indexes': <Map<String, dynamic>>[
-                for (final IndexDefinition d in _indexes.listIndexes())
-                  <String, dynamic>{
-                    'collection': d.collection,
-                    'fields': d.fields,
-                  },
-              ],
-            }),
-          ),
-        );
-
-        final BytesBuilder out = BytesBuilder(copy: false);
-        final ByteData head =
-            ByteData(6)
-              ..setUint32(0, archiveMagic, Endian.big)
-              ..setUint16(4, archiveVersion, Endian.big);
-        out.add(head.buffer.asUint8List());
-        Varint.write(out, metadata.length);
-        out.add(metadata);
-        Varint.write(out, bodyBytes.length);
-        out.add(bodyBytes);
-        out.add(
-          Uint8List.fromList(
-            sha256.convert(<int>[...metadata, ...bodyBytes]).bytes,
-          ),
-        );
-
-        final File file = File(archivePath);
-        await file.parent.create(recursive: true);
-        await file.writeAsBytes(out.takeBytes(), flush: true);
-        await _logger.info('Exported $entries entries to $archivePath');
-        return entries;
-      }),
+      () => _guardIo(
+        archivePath,
+        () => _ioMutex.run(() => _exportArchive(this, archivePath, encryption)),
+      ),
     );
   }
 
   /// Restores the archive at [archivePath] into a database at [path].
   ///
-  /// The target directory must be empty or non-existent unless [overwrite]
-  /// is set, in which case existing contents are deleted first. The archive's
-  /// checksum is verified before anything is written; a mismatch throws
-  /// [CorruptionException]. Index definitions recorded in the archive are
+  /// The archive's checksum is verified over the whole file before anything
+  /// is written; a mismatch throws [CorruptionException]. The data is
+  /// restored into a temporary sibling directory, in batches, and moved to
+  /// [path] only once complete, so a failure never leaves a half-restored
+  /// database behind.
+  ///
+  /// [path] must be empty or non-existent unless [overwrite] is set. Even
+  /// then, only a ReaxDB database is replaced (a directory without a ReaxDB
+  /// header is refused), and only while no instance has it open.
+  ///
+  /// [encryption] configures the restored database. [archiveEncryption] is
+  /// the configuration the archive was exported with, required for an
+  /// encrypted archive. Index definitions recorded in the archive are
   /// recreated and backfilled. Returns the restored database, open.
   static Future<ReaxDB> importFrom({
     required String archivePath,
     required String path,
     EncryptionConfig encryption = const EncryptionConfig.none(),
+    EncryptionConfig? archiveEncryption,
     SyncMode syncMode = SyncMode.full,
     bool overwrite = false,
-  }) async {
-    final File file = File(archivePath);
-    if (!await file.exists()) {
-      throw CorruptionException(
-        'Archive not found: $archivePath',
-        path: archivePath,
-      );
-    }
-    final Uint8List bytes = await file.readAsBytes();
-    if (bytes.length < 6 + 32) {
-      throw CorruptionException(
-        'Archive is too small to be a ReaxDB export',
-        path: archivePath,
-      );
-    }
-    final ByteData head = ByteData.sublistView(bytes, 0, 6);
-    if (head.getUint32(0, Endian.big) != archiveMagic) {
-      throw CorruptionException(
-        'Not a ReaxDB export archive (bad magic number)',
-        path: archivePath,
-        offset: 0,
-      );
-    }
-    final int version = head.getUint16(4, Endian.big);
-    if (version != archiveVersion) {
-      throw CorruptionException(
-        'Unsupported archive format version $version '
-        '(supported: $archiveVersion)',
-        path: archivePath,
-        offset: 4,
-      );
-    }
-
-    int cursor = 6;
-    final (int metaLength, int metaRead) = Varint.read(bytes, cursor);
-    cursor += metaRead;
-    final Uint8List metadata = Uint8List.sublistView(
-      bytes,
-      cursor,
-      cursor + metaLength,
-    );
-    cursor += metaLength;
-    final (int bodyLength, int bodyRead) = Varint.read(bytes, cursor);
-    cursor += bodyRead;
-    final Uint8List body = Uint8List.sublistView(
-      bytes,
-      cursor,
-      cursor + bodyLength,
-    );
-    cursor += bodyLength;
-    if (bytes.length - cursor != 32) {
-      throw CorruptionException(
-        'Archive trailer is malformed',
-        path: archivePath,
-        offset: cursor,
-      );
-    }
-    final Uint8List expected = Uint8List.sublistView(bytes, cursor);
-    final List<int> actual = sha256.convert(<int>[...metadata, ...body]).bytes;
-    for (int i = 0; i < 32; i++) {
-      if (actual[i] != expected[i]) {
-        throw CorruptionException(
-          'Archive checksum mismatch: the file is damaged or truncated',
-          path: archivePath,
-          offset: cursor,
-        );
-      }
-    }
-
-    final Map<String, dynamic> meta =
-        jsonDecode(utf8.decode(metadata)) as Map<String, dynamic>;
-
-    final Directory directory = Directory(path);
-    if (await directory.exists()) {
-      final bool empty = await directory.list().isEmpty;
-      if (!empty) {
-        if (!overwrite) {
-          throw DatabaseLockedException(
-            'Target directory "$path" is not empty. Pass overwrite: true to '
-            'replace its contents.',
-            path: path,
-          );
-        }
-        await directory.delete(recursive: true);
-      }
-    }
-
-    final ReaxDB db = await ReaxDB.open(
+  }) => _guardIo(
+    path,
+    () => _importArchive(
+      archivePath: archivePath,
       path: path,
       encryption: encryption,
+      archiveEncryption: archiveEncryption,
       syncMode: syncMode,
-      schemaVersion: (meta['schemaVersion'] as int?) ?? 1,
-    );
-    try {
-      int offset = 0;
-      Map<String, Object?> batch = <String, Object?>{};
-      final List<DateTime?> expiries = <DateTime?>[];
-      final List<String> batchKeys = <String>[];
-      Future<void> flushBatch() async {
-        for (int i = 0; i < batchKeys.length; i++) {
-          await db.put(
-            batchKeys[i],
-            batch[batchKeys[i]],
-            expiresAt: expiries[i],
-          );
-        }
-        batch = <String, Object?>{};
-        batchKeys.clear();
-        expiries.clear();
-      }
-
-      while (offset < body.length) {
-        final (int keyLength, int keyRead) = Varint.read(body, offset);
-        offset += keyRead;
-        final String key = utf8.decode(
-          Uint8List.sublistView(body, offset, offset + keyLength),
-        );
-        offset += keyLength;
-        final (int valueLength, int valueRead) = Varint.read(body, offset);
-        offset += valueRead;
-        final StoredRecord record = RecordEnvelope.decode(
-          Uint8List.sublistView(body, offset, offset + valueLength),
-        );
-        offset += valueLength;
-        batch[key] = record.value;
-        batchKeys.add(key);
-        expiries.add(record.expiresAt);
-        if (batchKeys.length >= 500) await flushBatch();
-      }
-      await flushBatch();
-
-      for (final Object? entry
-          in (meta['indexes'] as List<dynamic>? ?? const [])) {
-        final Map<String, dynamic> definition = entry as Map<String, dynamic>;
-        await db.createIndex(
-          definition['collection'] as String,
-          (definition['fields'] as List<dynamic>).cast<String>(),
-        );
-      }
-      return db;
-    } catch (_) {
-      await db.close();
-      rethrow;
-    }
-  }
+      overwrite: overwrite,
+    ),
+  );
 
   // -- lifecycle ----------------------------------------------------------
 
@@ -1596,75 +1637,58 @@ final class ReaxDB {
   /// its WAL, closes the transaction manager, index manager, cache, change
   /// stream hub and logger, releases the on-disk lock, and unregisters the
   /// instance so the path can be opened again. Idempotent.
-  Future<void> close() async {
-    if (_closed || _closing) return;
+  ///
+  /// A failure in one step never strands the database: the remaining steps
+  /// still run, the lock is released and the path can be opened again; the
+  /// first error is rethrown afterwards. A second call made while closing
+  /// waits for the first one.
+  Future<void> close() {
+    if (_closed) return Future<void>.value();
+    return _closeFuture ??= _closeOnce();
+  }
+
+  Future<void> _closeOnce() async {
     _closing = true;
-    while (_inFlight.isNotEmpty) {
-      await Future.wait<void>(_inFlight.toList());
+    Object? firstError;
+    StackTrace? firstStack;
+    Future<void> step(Future<void> Function() action) async {
+      try {
+        await action();
+      } catch (error, stack) {
+        firstError ??= error;
+        firstStack ??= stack;
+      }
     }
-    await _ioMutex.run(() async {
-      await _transactions.close();
-      await _indexes.close();
-      await _storage.close();
-      _cache.clear();
-      await _hub.close();
-    });
-    _instances.remove(_path);
-    await _releaseLock(_lockFile);
-    await _logger.info('Database closed');
-    await _logger.close();
-    _closed = true;
-    _closing = false;
+
+    try {
+      await step(() async {
+        while (_inFlight.isNotEmpty) {
+          await Future.wait<void>(_inFlight.toList());
+        }
+      });
+      await _ioMutex.run(() async {
+        await step(_transactions.close);
+        await step(_indexes.close);
+        await step(_storage.close);
+        _cache.clear();
+        await step(_hub.close);
+      });
+    } finally {
+      _instances.remove(_path);
+      await step(_lockFile.release);
+      await step(() => _logger.info('Database closed'));
+      await step(_logger.close);
+      _closed = true;
+      _closing = false;
+    }
+    final Object? error = firstError;
+    if (error != null) Error.throwWithStackTrace(error, firstStack!);
   }
 
   /// Closes every database open in this isolate. Intended for tests.
   static Future<void> closeAll() async {
     for (final ReaxDB db in _instances.values.toList()) {
       await db.close();
-    }
-  }
-
-  // -- locking ------------------------------------------------------------
-
-  /// Acquires the on-disk lock for [canonical].
-  ///
-  /// The lock is an OS advisory lock held on `<path>/LOCK` for the lifetime
-  /// of the instance. Because the operating system releases advisory locks
-  /// when a process dies, a crashed process never leaves a stale lock behind:
-  /// the file may remain on disk, but it is not locked and the next open
-  /// succeeds. There is therefore no stale-lock timeout to tune and no
-  /// "force unlock" switch.
-  static Future<RandomAccessFile> _acquireLock(String canonical) async {
-    final File file = File(p.join(canonical, lockFileName));
-    final RandomAccessFile handle = await file.open(mode: FileMode.write);
-    try {
-      await handle.lock(FileLock.exclusive);
-    } on FileSystemException catch (error) {
-      await handle.close();
-      throw DatabaseLockedException(
-        'Database at "$canonical" is locked by another process',
-        path: canonical,
-        cause: error,
-      );
-    }
-    try {
-      await handle.writeString('\$pid\n${DateTime.now().toIso8601String()}\n');
-    } catch (_) {
-      // The lock itself is what matters; the contents are informational.
-    }
-    return handle;
-  }
-
-  static Future<void> _releaseLock(RandomAccessFile handle) async {
-    try {
-      await handle.unlock();
-    } catch (_) {
-      // Already released, for example because the file was removed.
-    }
-    try {
-      await handle.close();
-    } catch (_) {
-      // Nothing further to do while closing.
     }
   }
 
@@ -1691,7 +1715,9 @@ final class ReaxTransaction {
   Future<T?> get<T>(String key) async {
     final Uint8List? stored = await _tx.get(key);
     if (stored == null) return null;
-    final StoredRecord record = RecordEnvelope.decode(_db._toEnvelope(stored));
+    final StoredRecord record = RecordEnvelope.decode(
+      _db._toEnvelope(stored, ReaxDB.encodeKey(key)),
+    );
     if (record.isExpiredAt(DateTime.now())) return null;
     return ReaxDB._cast<T>(key, record.value);
   }
@@ -1703,7 +1729,7 @@ final class ReaxTransaction {
     Duration? ttl,
     DateTime? expiresAt,
   }) {
-    ReaxDB.encodeKey(key);
+    final Uint8List keyBytes = ReaxDB.encodeKey(key);
     return _tx.put(
       key,
       _db._toStored(
@@ -1711,6 +1737,7 @@ final class ReaxTransaction {
           value,
           expiresAt: ReaxDB._resolveExpiry(ttl, expiresAt),
         ),
+        keyBytes,
       ),
     );
   }
@@ -1726,19 +1753,168 @@ final class ReaxTransaction {
 final class _Mutation {
   _Mutation.put(this.key, this.value, this.expiresAt)
     : envelope = RecordEnvelope.encode(value, expiresAt: expiresAt),
-      isDelete = false;
+      isDelete = false,
+      onlyIfExpired = false;
 
   _Mutation.delete(this.key)
     : value = null,
       envelope = null,
       expiresAt = null,
-      isDelete = true;
+      isDelete = true,
+      onlyIfExpired = false;
+
+  /// A delete that is skipped unless the stored entry is expired when the
+  /// pipeline applies it (TTL reclamation).
+  _Mutation.deleteIfExpired(this.key)
+    : value = null,
+      envelope = null,
+      expiresAt = null,
+      isDelete = true,
+      onlyIfExpired = true;
 
   final String key;
   final Object? value;
   final Uint8List? envelope;
   final DateTime? expiresAt;
   final bool isDelete;
+  final bool onlyIfExpired;
+}
+
+/// The exclusive lock on a database directory.
+///
+/// On Linux, Android, macOS and iOS it is a `flock(2)` on `<path>/LOCK`,
+/// taken through [NativeIo]. A `flock` belongs to one open file description,
+/// so it excludes another process, another isolate of this process, and a
+/// second open of the same directory through a different spelling of its
+/// path (a symlink, or different letter case on a case-insensitive file
+/// system). The operating system drops it when the process dies, and a
+/// native finalizer closes it if the isolate that holds it goes away
+/// without closing the database, so a crash never leaves a stale lock.
+///
+/// Elsewhere (Windows, or a file system without `flock`) it falls back to
+/// the `dart:io` advisory lock, which on POSIX only excludes other
+/// processes.
+final class _DatabaseLock implements Finalizable {
+  _DatabaseLock._native(this._fd) : _handle = null;
+
+  _DatabaseLock._io(this._handle) : _fd = null;
+
+  final int? _fd;
+  final RandomAccessFile? _handle;
+  bool _released = false;
+
+  static Future<_DatabaseLock> acquire(String canonical) async {
+    final File file = File(p.join(canonical, ReaxDB.lockFileName));
+    if (!await file.exists()) await file.create();
+    final String owner = '$pid\n${DateTime.now().toIso8601String()}\n';
+
+    final NativeIo? io = NativeIo.instance;
+    if (io != null) {
+      final int fd = io.tryLockExclusive(file.path);
+      if (fd >= 0) {
+        final _DatabaseLock lock = _DatabaseLock._native(fd);
+        io.closeFinalizer.attach(
+          lock,
+          Pointer<Void>.fromAddress(fd),
+          detach: lock,
+        );
+        try {
+          await file.writeAsString(owner, flush: true);
+        } catch (_) {
+          // The lock itself is what matters; the contents are informational.
+        }
+        return lock;
+      }
+      if (fd == NativeIo.lockBusy) {
+        throw DatabaseLockedException(
+          'Database at "$canonical" is already open: by another process, by '
+          'another isolate of this process, or by another ReaxDB instance '
+          'that opened the same directory through a different path. Close '
+          'that instance first; only one may write a database at a time.',
+          path: canonical,
+        );
+      }
+      // flock is not supported on this file system: fall back below.
+    }
+
+    final RandomAccessFile handle = await file.open(mode: FileMode.append);
+    try {
+      await handle.lock(FileLock.exclusive);
+    } on FileSystemException catch (error) {
+      await handle.close();
+      throw DatabaseLockedException(
+        'Database at "$canonical" is locked by another process',
+        path: canonical,
+        cause: error,
+      );
+    }
+    try {
+      await handle.truncate(0);
+      await handle.writeString(owner);
+    } catch (_) {
+      // The lock itself is what matters; the contents are informational.
+    }
+    return _DatabaseLock._io(handle);
+  }
+
+  Future<void> release() async {
+    if (_released) return;
+    _released = true;
+    final int? fd = _fd;
+    if (fd != null) {
+      final NativeIo io = NativeIo.instance!;
+      io.closeFinalizer.detach(this);
+      io.unlock(fd);
+      return;
+    }
+    final RandomAccessFile handle = _handle!;
+    try {
+      await handle.unlock();
+    } catch (_) {
+      // Already released, for example because the file was removed.
+    }
+    try {
+      await handle.close();
+    } catch (_) {
+      // Nothing further to do while closing.
+    }
+  }
+}
+
+/// Runs transaction commits inside the facade's write pipeline.
+final class _FacadeCommitPipeline implements CommitPipeline {
+  ReaxDB? _db;
+
+  void attach(ReaxDB db) => _db = db;
+
+  ReaxDB get _attached {
+    final ReaxDB? db = _db;
+    if (db == null) {
+      throw const DatabaseClosedException('Database is not open yet');
+    }
+    return db;
+  }
+
+  @override
+  Future<T> exclusive<T>(Future<T> Function() action) =>
+      _attached._ioMutex.run(action);
+
+  @override
+  Future<List<WriteOp>> extraOps(List<AppliedOperation> applied) =>
+      _attached._transactionIndexOps(applied);
+
+  @override
+  void afterCommit(CommitResult result) =>
+      _attached._afterTransactionCommit(result);
+
+  @override
+  void onAfterCommitError(Object error, StackTrace stack) {
+    unawaited(
+      _attached._logger.error(
+        'Post-commit maintenance failed after a durable commit: $error',
+      ),
+    );
+  }
 }
 
 /// The `collection:id` decomposition of a document key.
@@ -1779,14 +1955,29 @@ final class _FacadeDocumentStore implements DocumentStore {
 
   @override
   Stream<String> scanDocumentIds(String collection) async* {
-    await for (final DocumentRecord record in scanDocuments(collection)) {
-      yield record.id;
+    // Keys only: values are decrypted just far enough to check expiry, and
+    // documents are never decoded.
+    await for (final String key in _db.keys(prefix: '$collection:')) {
+      yield key.substring(collection.length + 1);
     }
   }
 
   @override
   Future<Map<String, dynamic>?> getDocument(String collection, String id) =>
       _db.get<Map<String, dynamic>>('$collection:$id');
+
+  @override
+  Future<List<DocumentRecord>> getDocuments(
+    String collection,
+    List<String> ids,
+  ) async {
+    final List<DocumentRecord> found = <DocumentRecord>[];
+    for (final String id in ids) {
+      final Map<String, dynamic>? document = await getDocument(collection, id);
+      if (document != null) found.add(DocumentRecord(id, document));
+    }
+    return found;
+  }
 
   @override
   Future<void> putDocument(
@@ -1812,9 +2003,13 @@ final class _DatabaseHeader {
     required this.kdfSalt,
     required this.kdfIterations,
     required this.createdAtMs,
+    this.keyCheck,
   });
 
   /// Header format version.
+  ///
+  /// Still 1: fields added since 2.0.0 ([keyCheck]) are optional, and 2.0.0
+  /// ignores fields it does not know.
   static const int formatVersion = 1;
 
   final int schemaVersion;
@@ -1823,12 +2018,27 @@ final class _DatabaseHeader {
   final int? kdfIterations;
   final int createdAtMs;
 
+  /// Token from `EncryptionEngine.createKeyCheck`, proving which key the
+  /// database was written with. Null for a 2.0.0 database until its first
+  /// open with a verified key.
+  final Uint8List? keyCheck;
+
   _DatabaseHeader withSchemaVersion(int version) => _DatabaseHeader(
     schemaVersion: version,
     encryptionType: encryptionType,
     kdfSalt: kdfSalt,
     kdfIterations: kdfIterations,
     createdAtMs: createdAtMs,
+    keyCheck: keyCheck,
+  );
+
+  _DatabaseHeader withKeyCheck(Uint8List token) => _DatabaseHeader(
+    schemaVersion: schemaVersion,
+    encryptionType: encryptionType,
+    kdfSalt: kdfSalt,
+    kdfIterations: kdfIterations,
+    createdAtMs: createdAtMs,
+    keyCheck: token,
   );
 
   static File _file(String directory) =>
@@ -1849,12 +2059,12 @@ final class _DatabaseHeader {
       final _DatabaseHeader header = _DatabaseHeader(
         schemaVersion: requestedSchemaVersion,
         encryptionType: encryption.type.name,
-        kdfSalt:
-            encryption is Aes256PassphraseConfig
-                ? KeyDerivation.generateSalt()
-                : null,
-        kdfIterations:
-            encryption is Aes256PassphraseConfig ? encryption.iterations : null,
+        kdfSalt: encryption is Aes256PassphraseConfig
+            ? KeyDerivation.generateSalt()
+            : null,
+        kdfIterations: encryption is Aes256PassphraseConfig
+            ? encryption.iterations
+            : null,
         createdAtMs: DateTime.now().millisecondsSinceEpoch,
       );
       await header.save(directory);
@@ -1918,12 +2128,14 @@ final class _DatabaseHeader {
       }
     }
 
+    final String? keyCheckBase64 = data['keyCheck'] as String?;
     return _DatabaseHeader(
       schemaVersion: data['schemaVersion'] as int,
       encryptionType: storedType,
       kdfSalt: saltBase64 == null ? null : base64Decode(saltBase64),
       kdfIterations: iterations,
       createdAtMs: data['createdAtMs'] as int? ?? 0,
+      keyCheck: keyCheckBase64 == null ? null : base64Decode(keyCheckBase64),
     );
   }
 
@@ -1936,6 +2148,7 @@ final class _DatabaseHeader {
       if (kdfSalt != null) 'kdfSalt': base64Encode(kdfSalt!),
       if (kdfIterations != null) 'kdfIterations': kdfIterations,
       'createdAtMs': createdAtMs,
+      if (keyCheck != null) 'keyCheck': base64Encode(keyCheck!),
     });
     final String document = jsonEncode(<String, dynamic>{
       'payload': payload,
@@ -1945,6 +2158,7 @@ final class _DatabaseHeader {
     final File temporary = File('${target.path}.tmp');
     await temporary.writeAsString(document, flush: true);
     await temporary.rename(target.path);
+    syncDirectory(directory);
   }
 }
 

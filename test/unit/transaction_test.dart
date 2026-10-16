@@ -327,8 +327,9 @@ void main() {
         ]);
         watch.stop();
 
-        final List<Object?> errors =
-            outcomes.where((Object? o) => o != null).toList();
+        final List<Object?> errors = outcomes
+            .where((Object? o) => o != null)
+            .toList();
         expect(
           errors,
           hasLength(1),

@@ -163,8 +163,10 @@ void main() {
         'user:1': <String, dynamic>{'name': 'Ada'},
         'user:2': <String, dynamic>{'name': 'Bob'},
       });
-      final List<Map<String, dynamic>> found =
-          await db.advanced.query('user').whereEquals('name', 'Ada').find();
+      final List<Map<String, dynamic>> found = await db.advanced
+          .query('user')
+          .whereEquals('name', 'Ada')
+          .find();
       expect(found, hasLength(1));
 
       await db.advanced.transaction<void>(

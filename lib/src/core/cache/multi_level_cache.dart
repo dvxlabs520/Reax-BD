@@ -94,10 +94,9 @@ final class ReaxCache {
   ReaxCache({
     int maxEntries = 10000,
     int maxMemoryBytes = 64 * 1024 * 1024,
-    Duration? defaultTtl,
+    this._defaultTtl,
   }) : _maxEntries = maxEntries,
-       _maxMemoryBytes = maxMemoryBytes,
-       _defaultTtl = defaultTtl {
+       _maxMemoryBytes = maxMemoryBytes {
     if (maxEntries <= 0) {
       throw ArgumentError.value(maxEntries, 'maxEntries', 'must be positive');
     }
@@ -222,8 +221,9 @@ final class ReaxCache {
       clear();
       return;
     }
-    String? key =
-        _byKey.containsKey(prefix) ? prefix : _byKey.firstKeyAfter(prefix);
+    String? key = _byKey.containsKey(prefix)
+        ? prefix
+        : _byKey.firstKeyAfter(prefix);
     while (key != null && key.startsWith(prefix)) {
       final String next = key;
       final String? following = _byKey.firstKeyAfter(next);

@@ -131,8 +131,9 @@ void main() {
       );
       final List<WalEntry> replayed = await reopened.replay().toList();
 
-      final Set<String> keys =
-          replayed.map((WalEntry e) => utf8.decode(e.key!)).toSet();
+      final Set<String> keys = replayed
+          .map((WalEntry e) => utf8.decode(e.key!))
+          .toSet();
       expect(
         keys,
         containsAll(<String>['c1', 'c2']),

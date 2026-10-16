@@ -11,9 +11,11 @@ produced by this harness and nothing else.
 # Everything, default sizes (1k and 10k documents), 3 repetitions
 dart run benchmark/reaxdb_benchmark.dart
 
-# The exact command used for BENCHMARKS.md
-dart run benchmark/reaxdb_benchmark.dart \
-  --sizes=1000,10000,100000 --runs=3 --sync=full,none --json=results.json
+# The exact commands used for BENCHMARKS.md (an AOT build, like a Flutter
+# release build)
+dart compile exe benchmark/reaxdb_benchmark.dart -o reaxdb_benchmark
+./reaxdb_benchmark --sizes=1000,10000,100000 --runs=3 --sync=full,none \
+  --json=results.json
 
 # One scenario, one size
 dart run benchmark/reaxdb_benchmark.dart --scenarios=point_read --sizes=100000
@@ -22,6 +24,10 @@ dart run benchmark/reaxdb_benchmark.dart --scenarios=point_read --sizes=100000
 dart run benchmark/reaxdb_benchmark.dart --list-scenarios
 dart run benchmark/reaxdb_benchmark.dart --help
 ```
+
+Under `dart run` the VM's JIT compiles the code with type feedback from the
+scenarios that ran first, which can skew later rows (see BENCHMARKS.md). Use
+an AOT build for numbers you intend to publish.
 
 Every database is created in a fresh temporary directory (under
 `--work-dir`, the system temp directory by default) and deleted afterwards, so

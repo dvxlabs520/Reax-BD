@@ -150,10 +150,9 @@ void main() {
       final results = await query('m').orderBy('v', nullsLast: true).find();
       expect(results.map((doc) => doc['v']).toList(), equals([1, 2, null]));
 
-      final descending =
-          await query(
-            'm',
-          ).orderBy('v', descending: true, nullsLast: true).find();
+      final descending = await query(
+        'm',
+      ).orderBy('v', descending: true, nullsLast: true).find();
       expect(descending.map((doc) => doc['v']).toList(), equals([2, 1, null]));
     });
 
@@ -174,12 +173,14 @@ void main() {
       for (int i = 0; i < 20; i++) {
         await store.putDocument('u', 'k$i', {'age': i, 'even': i.isEven});
       }
-      final unindexed =
-          await query('u').whereGreaterThan('age', 10).orderBy('age').find();
+      final unindexed = await query(
+        'u',
+      ).whereGreaterThan('age', 10).orderBy('age').find();
 
       await indexManager.createIndex('u', 'age');
-      final indexed =
-          await query('u').whereGreaterThan('age', 10).orderBy('age').find();
+      final indexed = await query(
+        'u',
+      ).whereGreaterThan('age', 10).orderBy('age').find();
 
       expect(
         indexed.map((doc) => doc['age']).toList(),
@@ -199,11 +200,13 @@ void main() {
       await store.putDocument('u', '1', {
         'address': {'city': 'lima'},
       });
-      final scanned =
-          await query('u').whereEquals('address.city', 'lima').find();
+      final scanned = await query(
+        'u',
+      ).whereEquals('address.city', 'lima').find();
       await indexManager.createIndex('u', 'address.city');
-      final indexed =
-          await query('u').whereEquals('address.city', 'lima').find();
+      final indexed = await query(
+        'u',
+      ).whereEquals('address.city', 'lima').find();
       expect(indexed, equals(scanned));
       expect(indexed, hasLength(1));
     });
@@ -275,10 +278,9 @@ void main() {
       await store.putDocument('users', 'a', {'id': 'u1', 'name': 'ana'});
       await store.putDocument('users', 'b', {'id': 'u9', 'name': 'zoe'});
 
-      final results =
-          await query(
-            'orders',
-          ).join('users', 'userId', 'id').orderBy('total').find();
+      final results = await query(
+        'orders',
+      ).join('users', 'userId', 'id').orderBy('total').find();
 
       expect(results, hasLength(2));
       final joined = results.first['_joined_users'] as List;

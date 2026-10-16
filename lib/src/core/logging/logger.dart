@@ -28,19 +28,16 @@ final class ReaxLogger {
   /// in a non-product build, and nothing otherwise. [name], when provided,
   /// is prefixed to every message (useful to distinguish databases).
   ReaxLogger({
-    LogLevel level = LogLevel.info,
+    this._level = LogLevel.info,
     List<LogOutput>? outputs,
-    bool enabled = true,
+    this._enabled = true,
     this.name,
-  }) : _level = level,
-       _enabled = enabled,
-       _outputs =
-           outputs != null
-               ? List<LogOutput>.of(outputs)
-               : <LogOutput>[
-                 if (const bool.fromEnvironment('dart.vm.product') == false)
-                   ConsoleLogOutput(),
-               ];
+  }) : _outputs = outputs != null
+           ? List<LogOutput>.of(outputs)
+           : <LogOutput>[
+               if (const bool.fromEnvironment('dart.vm.product') == false)
+                 ConsoleLogOutput(),
+             ];
 
   /// Process-wide default logger.
   static final ReaxLogger root = ReaxLogger();
@@ -131,7 +128,7 @@ final class ReaxLogger {
     }
     final String fullMessage = name == null ? message : '[$name] $message';
     final Map<String, dynamic> fullMetadata = <String, dynamic>{
-      if (metadata != null) ...metadata,
+      ...?metadata,
       if (error != null) 'error': error.toString(),
       if (stackTrace != null) 'stackTrace': stackTrace.toString(),
     };
@@ -168,4 +165,8 @@ final class ReaxLogger {
 }
 
 /// Process-wide default logger instance (same object as [ReaxLogger.root]).
+@Deprecated(
+  'Use ReaxLogger.root. This top-level name collides with package:logger. '
+  'Removed in 3.0.',
+)
 final ReaxLogger logger = ReaxLogger.root;

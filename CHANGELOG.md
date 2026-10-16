@@ -5,6 +5,173 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-10-16
+
+A correctness, durability and security release. Every fix below comes with a
+regression test that fails on 2.0.0. The on-disk format stays compatible:
+2.1 opens 2.0.0 databases and archives as they are.
+
+### Fixed — data loss and wrong results
+
+- A transaction and a plain `put` on the same key could leave the cache and
+  the secondary indexes disagreeing with storage, until eviction or restart.
+  Transactions now commit inside the write pipeline.
+- Index postings of a transaction were written in a second batch after the
+  commit, so a crash between the two lost them for good, and a failure there
+  reported a durable commit as failed. They now commit in the same atomic
+  batch as the documents.
+- TTL reclamation (`get` of an expired key, `purgeExpired`) could delete a
+  fresh value written at the same moment. It now re-checks each key under the
+  pipeline lock.
+- A `get` racing a `put` or `delete` of the same key could put the older
+  value back in the cache.
+- Expired documents left their index postings behind forever.
+- `compareAndSwap` always failed for maps and lists (it compared identity).
+- Integers beyond 2^53 matched their neighbours in queries, on both the index
+  and the scan path. `-0.0` did not equal `0`.
+- Optimistic transactions silently overwrote plain writes made while they
+  ran.
+- Collection names containing `:` silently missed index maintenance; they are
+  now rejected.
+- `dropIndex` interrupted by a crash could bring back an incomplete index;
+  `createIndex` could index a stale version of a document changed during the
+  backfill.
+- Storage engine: see "Fixed — storage engine" below.
+
+### Fixed — security
+
+- Opening an encrypted database with the wrong key or passphrase succeeded and
+  accepted writes, after which every scan failed even with the right key. A
+  key check stored in the header now rejects the wrong key at `open`. A 2.0.0
+  database gets its key check on the first open by 2.1, after the key has been
+  proven against a stored value.
+- AES-GCM values were not bound to their key: copying the ciphertext of one
+  key onto another decrypted fine. New values use envelope version 2, which
+  authenticates the record key as associated data. Version 1 values written
+  by 2.0.0 are still read.
+- PBKDF2 key derivation (210,000 iterations) ran on the calling isolate and
+  froze a Flutter UI for seconds. It now runs in `Isolate.run`.
+- Two isolates of one process, or a symlinked or differently cased path,
+  could open the same database at once and lose writes. The lock is now a
+  `flock(2)` taken through `dart:ffi`, which excludes all of them; Windows
+  keeps the `dart:io` lock, which already did.
+- `Redaction.key` was a plain truncated SHA-256, reversible for guessable keys
+  such as emails. It is now an HMAC under a random per-isolate key.
+- Migration warnings contained raw 1.x keys, and were logged.
+- `importFrom(overwrite: true)` deleted any non-empty directory, ReaxDB or not.
+
+### Fixed — 1.x migration
+
+- An in-place migration that failed (for example with the wrong legacy key)
+  or crashed midway left an empty or partial database at the path and gave no
+  warning. Everything that can fail is now checked before the 1.x files are
+  touched, the new database is built in a staging directory and swapped in
+  when complete, and `ReaxDB.open` finishes or discards an interrupted
+  migration before opening.
+- Migration reads one SSTable at a time and writes in batches, instead of
+  holding the whole database in memory.
+
+### Fixed — storage engine
+
+- A failed manifest write during compaction (for example a full disk) left
+  the next flush reusing the id of a live table: the flushed data was lost on
+  restart. Table ids now only go up, and new levels are installed only after
+  the manifest naming them is durable.
+- A failed WAL append (`ENOSPC`, `EIO`) left a partial record that made the
+  database impossible to open, hiding every acknowledged write. The log is
+  now cut back to the last complete record (or moved to a new segment), and
+  the failed batch throws without consuming sequence numbers.
+- Overwriting the same keys never filled the memtable, so the WAL grew
+  without bound (105 MB for 100,000 overwrites of one key) and was replayed
+  in full on open. A flush now also triggers on WAL size
+  (`walFlushThresholdBytes`), and replay streams segments.
+- A zero-length or short newest WAL segment (a crash right after creating
+  it) made open fail. It is treated as empty; segment headers are always
+  fsynced.
+- A corrupt record followed by valid later records was treated as a torn
+  tail, and those fsynced records were silently truncated away. Open now
+  throws `CorruptionException` and leaves the file intact; a genuine torn
+  tail is copied to `<segment>.corrupt-tail` before it is truncated.
+- A write whose WAL append succeeded threw anyway when the flush that
+  followed failed. Background flush and compaction failures no longer fail
+  durable writes: they are logged and retried.
+- Replaced SSTables and their file handles stayed until `close()` (12.6 MB on
+  disk for 0.4 MB of live data, 138 open descriptors after a few rewrite
+  rounds; iOS allows 256). Tables are reference-counted and deleted as soon
+  as no reader holds them; idle read handles are capped.
+- Range scans read and decoded each table to its end before yielding
+  anything, ignoring `limit`. They are now lazy and stop when the consumer
+  stops; level 1+ lookups binary-search the level; the per-table key index
+  keeps every 16th key plus a 4-byte fingerprint per entry instead of a copy
+  of every key.
+- A failed write no longer leaks the file handle or the temporary file of a
+  manifest or SSTable.
+
+### Fixed — reliability
+
+- Raw `FileSystemException`s escaped the API (for example `ReaxDB.simple`
+  with a relative path on iOS/Android). They are now `StorageException`s,
+  with a hint about absolute paths on mobile.
+- A failure inside `close()` left the database half closed, holding its lock
+  forever. Every step now runs, the lock is always released, and a second
+  `close()` waits for the first.
+- The `LOCK` file contained the literal text `$pid`.
+- A second `open` issued while the first instance was closing could slip
+  through.
+- File creations and renames are made durable by fsyncing their directory
+  (through `dart:ffi` on Linux, Android, macOS and iOS).
+
+### Changed
+
+- **Backups.** `exportTo` streams the archive (memory no longer grows with the
+  database), writes it to a temporary file and renames it into place, and can
+  encrypt it: `exportTo(path, encryption: EncryptionConfig.aes256...)`, with
+  `importFrom(..., archiveEncryption: ...)`. Archives are format version 2;
+  version 1 archives from 2.0 still import. `importFrom` verifies the whole
+  file first, restores in batches into a staging directory and moves it into
+  place when complete. Plaintext archives are now clearly documented as such.
+- **Change streams are bounded.** A paused or slow subscription queues at most
+  `changeStreamBufferSize` events (`ReaxDB.open`, default 10,000); one more
+  ends it with `ChangeStreamOverflowException`. Before, it buffered without
+  limit while the documentation promised backpressure.
+- Index-served queries stream their candidates, so `limit` without `orderBy`
+  and `findOne` stop the index scan early. `count()` without conditions reads
+  keys only.
+- Minimum SDK is now Dart 3.12 (Flutter 3.44): ReaxDB supports the current
+  and the previous stable Flutter release.
+- `StorageStats` is exported. The top-level `logger` is deprecated in favour
+  of `ReaxLogger.root` (it collides with `package:logger`).
+
+### Performance
+
+Measured AOT on the same machine against 2.0.0, at 100,000 documents (see
+[BENCHMARKS.md](BENCHMARKS.md)): durable sequential writes +17%, random writes
++27%, batches +7%, a 100-entry range scan 15x faster, a full-scan query 7%
+faster, opening a closed database 11% faster; cold point reads unchanged; an
+indexed query returning 5,000 documents 5% slower.
+
+### Added
+
+- `StorageException` and `ChangeStreamOverflowException`. Both are new
+  subtypes of the sealed `ReaxDbException`: an exhaustive `switch` over it
+  needs two more cases.
+- `ReaxDB.open(changeStreamBufferSize:)`, `exportTo(encryption:)`,
+  `importFrom(archiveEncryption:)`.
+- Continuous integration on Linux, macOS and Windows with Flutter 3.44 and
+  3.47.
+- The benchmark harness also runs compiled with `dart compile exe`
+  (`reopen_wal_replay` used to require `dart run`); BENCHMARKS.md now reports
+  AOT numbers, which is how Flutter release builds run.
+
+### Documentation
+
+- The README no longer says 1.x data cannot be read (it migrates).
+- Documented what is not encrypted (keys and indexed field values), the
+  `SyncMode.full` limits on Apple platforms, lost updates under the default
+  `readCommitted` isolation, cross-type comparisons, and result order without
+  `orderBy`.
+- The quick start shows an absolute path from `path_provider` for Flutter.
+
 ## [2.0.0] - 2026-07-30
 
 A rewrite of the storage engine, transaction manager, query layer, encryption

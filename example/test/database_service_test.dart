@@ -281,7 +281,7 @@ void main() {
     final ReaxDB again = await DatabaseService.open(
       'migration',
       schemaVersion: 2,
-      onUpgrade: (_, __, ___) async => calls++,
+      onUpgrade: (_, _, _) async => calls++,
     );
     addTearDown(again.close);
     expect(calls, 1);

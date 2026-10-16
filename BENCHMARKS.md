@@ -8,7 +8,8 @@ this file, it was not measured.
 
 ## What was measured, and how
 
-**Date:** 30 July 2026
+**Date:** 16 October 2026, ReaxDB 2.1.0. The 2.0.0 comparison column was
+measured the same day, on the same machine, with the 2.0.0 harness.
 
 **Machine**
 
@@ -17,21 +18,30 @@ this file, it was not measured.
 | Model | Apple M5 Pro, 15 logical cores |
 | Memory | 24 GiB |
 | Storage | Internal NVMe SSD, APFS |
-| OS | macOS 26.5.2 (build 25F84) |
-| Dart | 3.11.1 (stable), `macos_arm64` |
-| Asserts | disabled (the harness prints this; it was `false` for this run) |
+| OS | macOS 27.0 (build 26A428) |
+| Dart | 3.13.5 (stable), `macos_arm64` |
+| Build | AOT (`dart compile exe`), asserts disabled |
 
 **Command**
 
 ```bash
-dart run benchmark/reaxdb_benchmark.dart \
-  --sizes=1000,10000,100000 --runs=3 --sync=full,none --json=results.json
+dart compile exe benchmark/reaxdb_benchmark.dart -o reaxdb_benchmark
+./reaxdb_benchmark --sizes=1000,10000,100000 --runs=3 --sync=full,none \
+  --json=results.json
 ```
 
-That single command produced every row in the table below. Three repetitions of
-each scenario were run; the reported row is the **median repetition**, and the
-`run spread` column is the gap between the slowest and the fastest repetition,
-so you can see for yourself how stable each measurement was.
+The numbers are from an AOT build because that is how a Flutter app runs in
+release mode. Under `dart run` (JIT) most rows are similar, but some are not
+representative: in a JIT run that has already exercised the smaller sizes,
+`query_indexed` at 100,000 documents measured 517-553 ms, against 205-221 ms
+in a fresh JIT process and 218 ms in the AOT build. Benchmark AOT builds, or a
+Flutter release build, before drawing conclusions.
+
+Three repetitions of each scenario were run; the reported row is the **median
+repetition**, and the `run spread` column is the gap between the slowest and
+the fastest repetition, so you can see for yourself how stable each
+measurement was. The `query_*` rows are from a second run of the `query`
+scenario, made after the last change to the query path.
 
 **Method**
 
@@ -53,13 +63,31 @@ reproduce or vary this.
 ## No cross-database comparison was run
 
 **ReaxDB has not been benchmarked against Hive, Isar, sqflite, SQLite, ObjectBox
-or anything else.** Earlier versions of this file contained such a comparison,
-built from numbers other projects published for other hardware, other Dart
-versions and other workloads, mixed with figures explicitly labelled
-"estimated". Those were not measurements, and they have been removed rather
-than refreshed. If you need to know how ReaxDB compares with another database
-for your workload, benchmark both on your hardware; this harness is a
+or anything else.** If you need to know how ReaxDB compares with another
+database for your workload, benchmark both on your hardware; this harness is a
 reasonable starting point for the ReaxDB half.
+
+## 2.1.0 against 2.0.0
+
+At 100,000 documents, both versions built AOT on the same machine:
+
+| Scenario | 2.0.0 | 2.1.0 | Change |
+| --- | ---: | ---: | ---: |
+| Sequential write, `SyncMode.full`, ops/sec | 16,793 | 19,642 | +17% |
+| Random write, `SyncMode.full`, ops/sec | 14,105 | 17,863 | +27% |
+| `putBatch` of 500, `SyncMode.full`, docs/sec | 79,505 | 85,430 | +7% |
+| Point read, cold, p50 | 25 us | 24 us | same |
+| Range scan of 100 entries, p50 | 9.18 ms | 0.62 ms | 15x faster |
+| Indexed query, 5,000 matches, p50 | 208 ms | 218 ms | +5% slower |
+| Full-scan query, 5,000 matches, p50 | 400 ms | 372 ms | 7% faster |
+| Transaction commit, `SyncMode.full`, ops/sec | 18,039 | 18,227 | same |
+| Open after a clean close, p50 | 12.50 ms | 11.09 ms | 11% faster |
+
+The range scan gain comes from lazy, chunked SSTable iteration that stops at
+the window's end (2.0.0 read every table to its end). The write gains were not
+traced to a single change; 2.1 rewrote large parts of the WAL and of table
+management. The indexed query is the one row that got slower; at 1,000 and
+10,000 documents the difference is 7% and 2%.
 
 ## Headline results
 
@@ -70,15 +98,15 @@ reasonable starting point for the ReaxDB half.
 
 | Operation | `SyncMode.full` (durable) | `SyncMode.none` (buffered) | Ratio |
 | --- | ---: | ---: | ---: |
-| Sequential write, p50 | 65 us | 4 us | 16x |
-| Sequential write, ops/sec | 12,001 | 58,805 | 4.9x |
-| Random write, p50 | 71 us | 8 us | 8.9x |
-| Transaction commit, p50 | 77 us | 8 us | 9.6x |
+| Sequential write, p50 | 40 us | 4 us | 10x |
+| Sequential write, ops/sec | 19,642 | 76,827 | 3.9x |
+| Random write, p50 | 43 us | 6 us | 7.2x |
+| Transaction commit, p50 | 48 us | 7 us | 6.9x |
 
 This is the honest trade-off, and it is what the modes mean. The
 `reopen_wal_replay` scenario makes the consequence concrete: a child process
 writes N documents and is killed without closing the database, then the parent
-opens it and counts what survived the replay.
+opens it and counts what survived.
 
 | Documents acknowledged | Recovered with `SyncMode.full` | Recovered with `SyncMode.none` |
 | ---: | ---: | ---: |
@@ -86,10 +114,10 @@ opens it and counts what survived the replay.
 | 10,000 | 10,000 | 9,856 |
 | 100,000 | 100,000 | 99,964 |
 
-`SyncMode.none` lost acknowledged writes in every single run. That is the
-documented meaning of the mode, not a defect, but it is why `SyncMode.full` is
-the default and why the buffered numbers above must never be quoted as
-"ReaxDB's write performance" without the caveat.
+`SyncMode.none` lost acknowledged writes in every run. That is the documented
+meaning of the mode, not a defect, but it is why `SyncMode.full` is the default
+and why the buffered numbers above must never be quoted as "ReaxDB's write
+performance" without the caveat.
 
 ### Batching amortises the fsync
 
@@ -98,14 +126,13 @@ batch:
 
 | Path | `SyncMode.full` | `SyncMode.none` |
 | --- | ---: | ---: |
-| `put`, one document at a time | 12,001 docs/sec | 58,805 docs/sec |
-| `putBatch`, 500 documents | 62,793 docs/sec | 63,606 docs/sec |
+| `put`, one document at a time | 19,642 docs/sec | 76,827 docs/sec |
+| `putBatch`, 500 documents | 85,430 docs/sec | 85,956 docs/sec |
 
-Batching is a 5.2x improvement for durable writes, and it makes the sync mode
-almost irrelevant (62,793 vs 63,606): once the fsync is amortised across 500
-documents the bottleneck is the memtable flush and compaction, not the sync.
-The durable batch path therefore costs essentially nothing over the buffered
-one. Batch, and keep the durability.
+Batching is a 4.3x improvement for durable writes, and it makes the sync mode
+almost irrelevant: once the fsync is amortised across 500 documents the
+bottleneck is the memtable flush and compaction, not the sync. Batch, and keep
+the durability.
 
 ### Cache hits are not storage reads
 
@@ -116,11 +143,11 @@ over the same keys. The measured cache hit ratio is printed with each row.
 
 | 100,000 documents | p50 | p99 | ops/sec | cache hit ratio |
 | --- | ---: | ---: | ---: | ---: |
-| `point_read_cold` (SSTable read) | 31 us | 93 us | 27,897 | 0.0% |
-| `point_read_warm` (in-process cache) | 1 us | 2 us | 825,431 | 100.0% |
+| `point_read_cold` (SSTable read) | 24 us | 31 us | 41,126 | 0.0% |
+| `point_read_warm` (in-process cache) | 1 us | 1 us | 1,278,518 | 100.0% |
 
-A cache hit is roughly 30x faster than a storage read. Publishing only the warm
-number would inflate ReaxDB's apparent read throughput by about thirty times,
+A cache hit is roughly 24x faster than a storage read. Publishing only the warm
+number would inflate ReaxDB's apparent read throughput by about that factor,
 so both are published. An application whose cache is smaller than its working
 set lands between the two rows.
 
@@ -136,17 +163,16 @@ identical collections, one with a secondary index on the field and one without.
 
 | Documents | Matches returned | Indexed p50 | Full-scan p50 | Speed-up |
 | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 50 | 268 us | 4.79 ms | 17.9x |
-| 10,000 | 500 | 2.65 ms | 53.86 ms | 20.3x |
-| 100,000 | 5,000 | 289 ms | 529 ms | 1.8x |
+| 1,000 | 50 | 184 us | 3.67 ms | 20x |
+| 10,000 | 500 | 1.80 ms | 37.90 ms | 21x |
+| 100,000 | 5,000 | 218 ms | 372 ms | 1.7x |
 
 The index is worth roughly 20x while the result set is small. At 100,000
 documents the query matches 5,000 documents, and loading and decoding those
-5,000 documents dominates everything the index saved, so the advantage
-collapses to 1.8x. This is a real property of the current query layer, not a
-measurement artefact: it materialises every matching document. Queries that
-select a small fraction of a collection benefit from indexes; queries that
-select 5% of a large collection barely do.
+5,000 documents (one storage read each, about 25 us) dominates everything the
+index saved. Queries that select a small fraction of a collection benefit from
+indexes; queries that select 5% of a large collection barely do. A `limit`
+without `orderBy` stops early, so it pays only for the documents it returns.
 
 ## Full results
 
@@ -155,78 +181,75 @@ repetition; tail percentiles are `n/a` where `n < 20`.
 
 | scenario | docs | sync | unit | n | p50 | p95 | p99 | max | ops/sec | run spread | notes |
 | --- | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| sequential_write | 1000 | full | document | 900 | 84.0 us | 155.0 us | 217.0 us | 519.0 us | 10,682 | 25.8% | |
-| sequential_write | 1000 | none | document | 900 | 5.0 us | 7.0 us | 69.0 us | 312.0 us | 135,115 | 36.9% | |
-| sequential_write | 10000 | full | document | 9000 | 64.0 us | 109.0 us | 160.0 us | 1.64 ms | 13,968 | 4.2% | |
-| sequential_write | 10000 | none | document | 9000 | 4.0 us | 5.0 us | 18.0 us | 1.12 ms | 188,269 | 13.2% | |
-| sequential_write | 100000 | full | document | 90000 | 65.0 us | 114.0 us | 169.0 us | 441 ms | 12,001 | 1.6% | |
-| sequential_write | 100000 | none | document | 90000 | 4.0 us | 6.0 us | 23.0 us | 462 ms | 58,805 | 3.6% | |
-| random_write | 1000 | full | document | 900 | 67.0 us | 125.0 us | 177.0 us | 256.0 us | 13,268 | 5.2% | |
-| random_write | 1000 | none | document | 900 | 5.0 us | 7.0 us | 14.0 us | 146.0 us | 165,168 | 9.3% | |
-| random_write | 10000 | full | document | 9000 | 70.0 us | 118.0 us | 168.0 us | 1.10 ms | 13,022 | 6.4% | |
-| random_write | 10000 | none | document | 9000 | 7.0 us | 10.0 us | 34.0 us | 1.46 ms | 120,281 | 10.9% | |
-| random_write | 100000 | full | document | 90000 | 71.0 us | 122.0 us | 177.0 us | 822 ms | 10,628 | 0.7% | |
-| random_write | 100000 | none | document | 90000 | 8.0 us | 11.0 us | 31.0 us | 851 ms | 39,736 | 2.3% | |
-| batch_write | 1000 | full | document | 2 | 2.60 ms | n/a | n/a | 2.84 ms | 192,678 | 32.8% | batch=500 |
-| batch_write | 1000 | none | document | 2 | 1.67 ms | n/a | n/a | 1.71 ms | 300,030 | 26.2% | batch=500 |
-| batch_write | 10000 | full | document | 18 | 1.82 ms | n/a | n/a | 5.66 ms | 233,712 | 19.5% | batch=500 |
-| batch_write | 10000 | none | document | 18 | 1.52 ms | n/a | n/a | 4.12 ms | 280,383 | 16.4% | batch=500 |
-| batch_write | 100000 | full | document | 180 | 1.81 ms | 6.76 ms | 109 ms | 489 ms | 62,793 | 4.6% | batch=500 |
-| batch_write | 100000 | none | document | 180 | 1.69 ms | 6.96 ms | 108 ms | 479 ms | 63,606 | 1.3% | batch=500 |
-| point_read_cold | 1000 | full | read | 900 | 30.0 us | 75.0 us | 95.0 us | 765.0 us | 28,062 | 17.2% | cache hits 0.0% |
-| point_read_warm | 1000 | full | read | 900 | 1.0 us | 2.0 us | 4.0 us | 86.0 us | 731,707 | 55.7% | cache hits 100.0% |
-| point_read_cold | 10000 | full | read | 9000 | 28.0 us | 64.0 us | 89.0 us | 1.67 ms | 29,851 | 2.8% | cache hits 0.0% |
-| point_read_warm | 10000 | full | read | 9000 | 1.0 us | 1.0 us | 2.0 us | 493.0 us | 881,661 | 3.5% | cache hits 100.0% |
-| point_read_cold | 100000 | full | read | 90000 | 31.0 us | 65.0 us | 93.0 us | 2.92 ms | 27,897 | 1.6% | cache hits 0.0% |
-| point_read_warm | 100000 | full | read | 90000 | 1.0 us | 1.0 us | 2.0 us | 5.08 ms | 825,431 | 8.1% | cache hits 100.0% |
-| range_scan | 1000 | full | entry | 18 | 947.5 us | n/a | n/a | 1.43 ms | 108,506 | 18.6% | 100-entry window |
-| range_scan | 10000 | full | entry | 90 | 3.56 ms | 8.23 ms | 9.46 ms | 9.81 ms | 25,966 | 12.3% | 100-entry window |
-| range_scan | 100000 | full | entry | 450 | 10.88 ms | 16.71 ms | 18.12 ms | 19.13 ms | 9,564 | 6.0% | 100-entry window |
-| query_indexed | 1000 | full | query | 36 | 268.0 us | 984.8 us | 1.40 ms | 1.46 ms | 2,609 | 24.2% | 50 matches |
-| query_full_scan | 1000 | full | query | 36 | 4.79 ms | 8.13 ms | 9.20 ms | 9.38 ms | 195.3 | 1.5% | 50 matches |
-| query_indexed | 10000 | full | query | 36 | 2.65 ms | 20.42 ms | 21.42 ms | 21.61 ms | 118.3 | 14.6% | 500 matches |
-| query_full_scan | 10000 | full | query | 36 | 53.86 ms | 58.88 ms | 59.66 ms | 59.97 ms | 18.5 | 4.4% | 500 matches |
-| query_indexed | 100000 | full | query | 9 | 289 ms | n/a | n/a | 360 ms | 3.4 | 7.0% | 5000 matches |
-| query_full_scan | 100000 | full | query | 9 | 529 ms | n/a | n/a | 561 ms | 1.9 | 5.7% | 5000 matches |
-| transaction_commit | 1000 | full | commit | 900 | 75.0 us | 142.0 us | 196.0 us | 532.0 us | 11,849 | 3.1% | 1 op/tx |
-| transaction_commit | 1000 | none | commit | 900 | 9.0 us | 11.0 us | 46.1 us | 234.0 us | 95,887 | 9.1% | 1 op/tx |
-| transaction_commit | 10000 | full | commit | 9000 | 73.0 us | 122.0 us | 174.0 us | 577.0 us | 12,466 | 1.4% | 1 op/tx |
-| transaction_commit | 10000 | none | commit | 9000 | 8.0 us | 11.0 us | 44.0 us | 1.07 ms | 102,318 | 5.8% | 1 op/tx |
-| transaction_commit | 100000 | full | commit | 18000 | 77.0 us | 138.0 us | 185.0 us | 33.25 ms | 11,429 | 8.8% | 1 op/tx |
-| transaction_commit | 100000 | none | commit | 18000 | 8.0 us | 11.0 us | 47.0 us | 31.01 ms | 79,931 | 6.6% | 1 op/tx |
-| reopen_clean | 1000 | full | open | 4 | 1.58 ms | n/a | n/a | 1.90 ms | 640.5 | 6.0% | |
-| reopen_clean | 10000 | full | open | 4 | 2.51 ms | n/a | n/a | 2.62 ms | 397.0 | 14.3% | |
-| reopen_clean | 100000 | full | open | 4 | 16.84 ms | n/a | n/a | 19.31 ms | 57.3 | 9.9% | |
-| reopen_wal_replay | 1000 | full | open | 1 | 6.45 ms | n/a | n/a | 6.45 ms | 155.1 | 20.6% | recovered 1000/1000 |
-| reopen_wal_replay | 1000 | none | open | 1 | 5.09 ms | n/a | n/a | 5.09 ms | 196.6 | 55.5% | recovered 991/1000 |
-| reopen_wal_replay | 10000 | full | open | 1 | 37.55 ms | n/a | n/a | 37.55 ms | 26.6 | 10.4% | recovered 10000/10000 |
-| reopen_wal_replay | 10000 | none | open | 1 | 36.75 ms | n/a | n/a | 36.75 ms | 27.2 | 1.8% | recovered 9856/10000 |
-| reopen_wal_replay | 100000 | full | open | 1 | 460 ms | n/a | n/a | 460 ms | 2.2 | 1.5% | recovered 100000/100000 |
-| reopen_wal_replay | 100000 | none | open | 1 | 464 ms | n/a | n/a | 464 ms | 2.2 | 2.4% | recovered 99964/100000 |
+| sequential_write | 1000 | full | document | 900 | 39.0 us | 51.0 us | 59.0 us | 205.0 us | 24,591 | 13.7% |  |
+| sequential_write | 1000 | none | document | 900 | 4.0 us | 5.0 us | 9.0 us | 41.0 us | 235,294 | 17.6% |  |
+| sequential_write | 10000 | full | document | 9000 | 43.0 us | 52.0 us | 61.0 us | 496.0 us | 22,888 | 8.1% |  |
+| sequential_write | 10000 | none | document | 9000 | 4.0 us | 4.0 us | 6.0 us | 659.0 us | 221,637 | 6.9% |  |
+| sequential_write | 100000 | full | document | 90000 | 40.0 us | 53.0 us | 62.0 us | 346 ms | 19,642 | 0.1% |  |
+| sequential_write | 100000 | none | document | 90000 | 4.0 us | 5.0 us | 10.0 us | 350 ms | 76,827 | 1.0% |  |
+| random_write | 1000 | full | document | 900 | 40.0 us | 51.0 us | 59.0 us | 288.0 us | 24,046 | 9.4% |  |
+| random_write | 1000 | none | document | 900 | 5.0 us | 8.0 us | 46.1 us | 148.0 us | 161,406 | 21.9% |  |
+| random_write | 10000 | full | document | 9000 | 42.0 us | 53.0 us | 60.0 us | 481.0 us | 22,908 | 4.3% |  |
+| random_write | 10000 | none | document | 9000 | 5.0 us | 7.0 us | 9.0 us | 592.0 us | 168,149 | 0.4% |  |
+| random_write | 100000 | full | document | 90000 | 43.0 us | 55.0 us | 63.0 us | 604 ms | 17,863 | 0.8% |  |
+| random_write | 100000 | none | document | 90000 | 6.0 us | 8.0 us | 10.0 us | 604 ms | 55,656 | 1.3% |  |
+| batch_write | 1000 | full | document | 2 | 1.35 ms | n/a | n/a | 1.38 ms | 369,549 | 26.9% | batch=500 |
+| batch_write | 1000 | none | document | 2 | 1.29 ms | n/a | n/a | 1.30 ms | 387,147 | 3.4% | batch=500 |
+| batch_write | 10000 | full | document | 18 | 1.34 ms | n/a | n/a | 2.20 ms | 345,835 | 7.9% | batch=500 |
+| batch_write | 10000 | none | document | 18 | 1.31 ms | n/a | n/a | 2.25 ms | 361,809 | 4.3% | batch=500 |
+| batch_write | 100000 | full | document | 180 | 1.39 ms | 3.08 ms | 80.16 ms | 361 ms | 85,430 | 1.4% | batch=500 |
+| batch_write | 100000 | none | document | 180 | 1.35 ms | 3.27 ms | 80.64 ms | 357 ms | 85,956 | 0.6% | batch=500 |
+| point_read_cold | 1000 | full | read | 900 | 23.0 us | 27.0 us | 29.0 us | 32.0 us | 43,894 | 4.5% | cacheHitRatio=0.0% |
+| point_read_warm | 1000 | full | read | 900 | 1.0 us | 1.0 us | 1.0 us | 2.0 us | 1,855,670 | 60.6% | cacheHitRatio=100.0% |
+| point_read_cold | 10000 | full | read | 9000 | 23.0 us | 27.0 us | 30.0 us | 1.01 ms | 42,732 | 1.3% | cacheHitRatio=0.0% |
+| point_read_warm | 10000 | full | read | 9000 | 1.0 us | 1.0 us | 1.0 us | 701.0 us | 1,473,960 | 5.9% | cacheHitRatio=100.0% |
+| point_read_cold | 100000 | full | read | 90000 | 24.0 us | 28.0 us | 31.0 us | 1.25 ms | 41,126 | 1.4% | cacheHitRatio=0.0% |
+| point_read_warm | 100000 | full | read | 90000 | 1.0 us | 1.0 us | 1.0 us | 2.15 ms | 1,278,518 | 4.8% | cacheHitRatio=100.0% |
+| range_scan | 1000 | full | entry | 18 | 433.0 us | n/a | n/a | 454.0 us | 233,402 | 0.6% | window=100, entriesRead=2000 |
+| range_scan | 10000 | full | entry | 90 | 423.0 us | 441.0 us | 664.1 us | 924.0 us | 231,995 | 1.6% | window=100, entriesRead=10000 |
+| range_scan | 100000 | full | entry | 450 | 617.0 us | 646.0 us | 713.5 us | 753.0 us | 172,578 | 2.3% | window=100, entriesRead=50000 |
+| query_indexed | 1000 | full | query | 36 | 183.5 us | 193.0 us | 521.9 us | 699.0 us | 5,090 | 6.8% | matches=50 |
+| query_full_scan | 1000 | full | query | 36 | 3.67 ms | 3.79 ms | 3.80 ms | 3.80 ms | 271.9 | 0.7% | matches=50 |
+| query_indexed | 10000 | full | query | 36 | 1.80 ms | 14.60 ms | 15.67 ms | 15.92 ms | 165.4 | 1.1% | matches=500 |
+| query_full_scan | 10000 | full | query | 36 | 37.90 ms | 38.54 ms | 38.78 ms | 38.88 ms | 26.4 | 1.7% | matches=500 |
+| query_indexed | 100000 | full | query | 9 | 218 ms | n/a | n/a | 263 ms | 4.5 | 1.1% | matches=5000 |
+| query_full_scan | 100000 | full | query | 9 | 372 ms | n/a | n/a | 376 ms | 2.7 | 0.6% | matches=5000 |
+| transaction_commit | 1000 | full | commit | 900 | 48.0 us | 65.0 us | 78.0 us | 310.0 us | 20,100 | 10.5% | opsPerTx=1 |
+| transaction_commit | 1000 | none | commit | 900 | 7.0 us | 8.0 us | 16.0 us | 371.0 us | 130,378 | 1.5% | opsPerTx=1 |
+| transaction_commit | 10000 | full | commit | 9000 | 48.0 us | 78.0 us | 200.0 us | 5.00 ms | 18,105 | 10.4% | opsPerTx=1 |
+| transaction_commit | 10000 | none | commit | 9000 | 7.0 us | 9.0 us | 33.0 us | 534.0 us | 120,984 | 23.5% | opsPerTx=1 |
+| transaction_commit | 100000 | full | commit | 18000 | 48.0 us | 80.0 us | 150.0 us | 21.11 ms | 18,227 | 5.2% | opsPerTx=1 |
+| transaction_commit | 100000 | none | commit | 18000 | 7.0 us | 8.0 us | 32.0 us | 21.65 ms | 109,148 | 11.5% | opsPerTx=1 |
+| reopen_clean | 1000 | full | open | 4 | 1.02 ms | n/a | n/a | 1.34 ms | 921.2 | 38.3% |  |
+| reopen_clean | 10000 | full | open | 4 | 1.74 ms | n/a | n/a | 2.19 ms | 542.2 | 9.2% |  |
+| reopen_clean | 100000 | full | open | 4 | 11.09 ms | n/a | n/a | 11.52 ms | 89.6 | 3.4% |  |
+| reopen_wal_replay | 1000 | full | open | 1 | 3.63 ms | n/a | n/a | 3.63 ms | 275.3 | 13.1% | acknowledged=1000, recovered=1000 |
+| reopen_wal_replay | 1000 | none | open | 1 | 3.64 ms | n/a | n/a | 3.64 ms | 274.4 | 4.6% | acknowledged=1000, recovered=991 |
+| reopen_wal_replay | 10000 | full | open | 1 | 26.85 ms | n/a | n/a | 26.85 ms | 37.2 | 6.7% | acknowledged=10000, recovered=10000 |
+| reopen_wal_replay | 10000 | none | open | 1 | 27.78 ms | n/a | n/a | 27.78 ms | 36.0 | 0.3% | acknowledged=10000, recovered=9856 |
+| reopen_wal_replay | 100000 | full | open | 1 | 460 ms | n/a | n/a | 460 ms | 2.2 | 3.5% | acknowledged=100000, recovered=100000 |
+| reopen_wal_replay | 100000 | none | open | 1 | 448 ms | n/a | n/a | 448 ms | 2.2 | 3.8% | acknowledged=100000, recovered=99964 |
 
 ## Reading the tails
 
 The `max` column is where the compaction work shows up. Individual writes are
 tens of microseconds at p99, but the slowest single `put` in the
-100,000-document run took 441 ms (`SyncMode.full`) and 462 ms
-(`SyncMode.none`), and the slowest 500-document batch took 489 ms. Those are
+100,000-document run took 346 ms (`SyncMode.full`) and 350 ms
+(`SyncMode.none`), and the slowest 500-document batch took 361 ms. Those are
 the calls that happened to trigger a memtable flush plus a multi-level
 compaction, which ReaxDB currently performs **inline, on the calling
 operation**. If your application cares about worst-case write latency rather
 than throughput, that is the number that matters.
 
 Startup behaves the same way. Opening a cleanly closed 100,000-document
-database takes 16.84 ms, because the WAL was checkpointed during `close()` and
+database takes 11.09 ms, because the WAL was checkpointed during `close()` and
 there is nothing to replay. Opening the same database after a process was
-killed takes 460 ms, because all 100,000 records have to be replayed from the
-log. Frequent checkpoints buy faster recovery.
+killed takes 460 ms, because the records written since the last checkpoint
+have to be replayed from the log. Frequent checkpoints buy faster recovery.
 
-Range scans get more expensive per entry as the database grows: a 100-entry
-window costs 9.5 us per entry at 1,000 documents, 35.6 us at 10,000 and
-108.8 us at 100,000. A short scan has to merge iterators across every level
-that could contain the range, so the fixed setup cost of the merge grows with
-the number of tables. Short scans over large databases are currently the
-weakest part of the read path.
+Range scans now cost about the same per entry at every size: a 100-entry
+window costs 4.3 us per entry at 1,000 documents, 4.2 us at 10,000 and 6.2 us
+at 100,000 (2.0.0: 7.4 us, 31.1 us and 91.8 us in the same AOT run).
 
 ## Limitations of this methodology
 
@@ -239,9 +262,9 @@ Read these before quoting anything above.
 2. **`fsync` is not `F_FULLFSYNC`.** `SyncMode.full` calls
    `RandomAccessFile.flush()`, which is `fsync(2)`. On macOS and APFS that does
    not force the drive's own write cache. The durability being measured is
-   "survives a process kill", which is what ReaxDB's contract promises;
-   durability against sudden power loss on a drive with a volatile write cache
-   is a stronger property that these numbers do not represent.
+   "survives a process kill"; durability against sudden power loss on a drive
+   with a volatile write cache is a stronger property that these numbers do not
+   represent.
 3. **The OS page cache is warm.** No scenario purges it, so even the "cold"
    reads benefit from it. Treat `point_read_cold` as an upper bound.
 4. **Single isolate, no contention.** Every scenario is strictly sequential.
@@ -251,14 +274,16 @@ Read these before quoting anything above.
 5. **200-byte documents only.** Value size was not varied. Large values (the
    stress suite round-trips 1 MiB values) were not benchmarked.
 6. **No encryption.** Every measurement uses `EncryptionConfig.none()`.
-   AES-256-GCM adds per-record cost that is not reflected here.
+   AES-256-GCM adds per-record cost that is not reflected here, and opening a
+   passphrase-encrypted database adds the PBKDF2 derivation (about 1.5 s at the
+   default 210,000 iterations in an AOT build on this machine, run off the
+   calling isolate).
 7. **Rows with `n < 20` have no meaningful tail.** `batch_write` at 1,000
    documents is two samples. Treat those rows as an order of magnitude.
 8. **A `run spread` above roughly 15% means the machine was noisy.** Several
-   small-size rows exceed that; `point_read_warm` at 1,000 documents is 55.7%,
-   because a 1-microsecond operation sits at the resolution limit of the clock.
-   Prefer the 100,000-document rows, whose spreads are mostly under 5%, when
-   you need a number you can rely on.
+   small-size rows exceed that, and `point_read_warm` sits at the resolution
+   limit of the clock. Prefer the 100,000-document rows, whose spreads are
+   mostly under 5%, when you need a number you can rely on.
 9. **`--runs=3` is a small sample.** Taking the median of three repetitions
    protects against one unlucky run, not against a systematic bias. Raise
    `--runs` if you need tighter confidence.
@@ -269,11 +294,13 @@ Read these before quoting anything above.
 git clone https://github.com/dvillegastech/Reax-BD
 cd Reax-BD
 dart pub get
-dart run benchmark/reaxdb_benchmark.dart \
-  --sizes=1000,10000,100000 --runs=3 --sync=full,none --json=results.json
+dart compile exe benchmark/reaxdb_benchmark.dart -o reaxdb_benchmark
+./reaxdb_benchmark --sizes=1000,10000,100000 --runs=3 --sync=full,none \
+  --json=results.json
 ```
 
-The harness prints the machine, Dart version, core count, assert state and
-configuration it ran with, so any output you post is self-describing. See
-[`benchmark/README.md`](benchmark/README.md) for the scenario catalogue and the
-full option list.
+`dart run benchmark/reaxdb_benchmark.dart` with the same flags also works (see
+the JIT caveat above). The harness prints the machine, Dart version, core
+count, assert state and configuration it ran with, so any output you post is
+self-describing. See [`benchmark/README.md`](benchmark/README.md) for the
+scenario catalogue and the full option list.

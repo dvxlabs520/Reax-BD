@@ -110,8 +110,10 @@ void main() {
       await wal.close();
 
       final reopened = await WriteAheadLog.open(directory: dir.path);
-      final keys =
-          await reopened.replay().map((e) => utf8.decode(e.key!)).toList();
+      final keys = await reopened
+          .replay()
+          .map((e) => utf8.decode(e.key!))
+          .toList();
       expect(keys, ['committed', 'plain']);
       await reopened.close();
     });

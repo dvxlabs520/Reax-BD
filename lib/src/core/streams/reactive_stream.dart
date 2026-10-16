@@ -13,17 +13,20 @@
 ///
 /// ## Backpressure
 ///
-/// Database change events are push-based and are never buffered by the hub
-/// itself: an unlistened pattern drops events (there is no controller to
-/// hold them), and a paused subscription buffers inside its own Dart stream
-/// subscription only. Operator streams honor `pause`/`resume` by pausing
-/// their upstream subscription, so backpressure propagates to the source.
-/// Slow consumers should bound their intake with [ReactiveStream.debounce],
+/// Database change events are push-based: a write never waits for a
+/// listener. An unlistened pattern drops events (there is no controller to
+/// hold them). A paused or slow subscription queues its events, up to
+/// [ChangeStreamHub.maxBufferedEvents] per subscription; one more event
+/// ends that subscription with a [ChangeStreamOverflowException] instead of
+/// growing without bound or dropping events silently. A consumer that sees
+/// it should re-read the state it cares about and subscribe again. Slow
+/// consumers should bound their intake with [ReactiveStream.debounce],
 /// [ReactiveStream.throttle], [ReactiveStream.buffer] or
 /// [ReactiveStream.bufferTime].
 library;
 
 import 'dart:async';
+import 'dart:collection';
 
 import '../../domain/entities/database_entity.dart';
 import '../errors/exceptions.dart';
@@ -328,8 +331,18 @@ typedef SnapshotLoader = Future<List<DatabaseChangeEvent>> Function();
 /// subscriber cancels, so idle patterns hold no memory. Publishing costs
 /// O(key length + #glob patterns), not O(#patterns).
 final class ChangeStreamHub {
-  /// Creates an empty hub.
-  ChangeStreamHub();
+  /// Creates an empty hub whose subscriptions queue at most
+  /// [maxBufferedEvents] undelivered events each.
+  ChangeStreamHub({this.maxBufferedEvents = defaultMaxBufferedEvents})
+    : assert(maxBufferedEvents > 0);
+
+  /// Default for [maxBufferedEvents].
+  static const int defaultMaxBufferedEvents = 10000;
+
+  /// Undelivered events one subscription may queue (while paused, or while
+  /// its snapshot loads) before it is ended with a
+  /// [ChangeStreamOverflowException].
+  final int maxBufferedEvents;
 
   final Map<String, StreamController<DatabaseChangeEvent>> _exact = {};
   final Map<String, StreamController<DatabaseChangeEvent>> _byPrefix = {};
@@ -390,55 +403,86 @@ final class ChangeStreamHub {
     if (_closed) {
       throw const DatabaseClosedException('ChangeStreamHub is closed');
     }
-    if (initialEvents == null) {
-      // Multi stream so each listener triggers controller acquisition and
-      // release independently.
-      return Stream<DatabaseChangeEvent>.multi((controller) {
-        final StreamSubscription<DatabaseChangeEvent> subscription = _streamFor(
-          pattern,
-        ).listen(
-          controller.add,
-          onError: controller.addError,
-          onDone: controller.close,
-        );
-        controller.onCancel = subscription.cancel;
-        controller.onPause = subscription.pause;
-        controller.onResume = subscription.resume;
-      });
-    }
+    // Multi stream so each listener triggers controller acquisition and
+    // release independently, with its own bounded queue.
     return Stream<DatabaseChangeEvent>.multi((controller) {
-      final List<DatabaseChangeEvent> queued = [];
-      bool snapshotDone = false;
-      final StreamSubscription<DatabaseChangeEvent> subscription = _streamFor(
-        pattern,
-      ).listen(
+      final Queue<DatabaseChangeEvent> queued = Queue<DatabaseChangeEvent>();
+      bool snapshotDone = initialEvents == null;
+      bool paused = false;
+      bool ended = false;
+      late final StreamSubscription<DatabaseChangeEvent> subscription;
+
+      void drain() {
+        while (!ended && !paused && snapshotDone && queued.isNotEmpty) {
+          controller.add(queued.removeFirst());
+        }
+      }
+
+      void overflow() {
+        ended = true;
+        final int dropped = queued.length + 1;
+        queued.clear();
+        unawaited(subscription.cancel());
+        controller.addError(
+          ChangeStreamOverflowException(
+            'A change stream for "$pattern" fell $dropped events behind '
+            '(limit $maxBufferedEvents) and was closed. Re-read the state you '
+            'need and subscribe again, or consume events faster.',
+            pattern: pattern,
+          ),
+        );
+        unawaited(controller.close());
+      }
+
+      subscription = _streamFor(pattern).listen(
         (DatabaseChangeEvent event) {
-          if (snapshotDone) {
+          if (ended) return;
+          if (!paused && snapshotDone && queued.isEmpty) {
             controller.add(event);
-          } else {
-            queued.add(event);
+            return;
           }
+          if (queued.length >= maxBufferedEvents) {
+            overflow();
+            return;
+          }
+          queued.add(event);
         },
         onError: controller.addError,
-        onDone: controller.close,
+        onDone: () {
+          if (ended) return;
+          drain();
+          controller.close();
+        },
       );
-      controller.onCancel = subscription.cancel;
-      Future<void>(() async {
-        try {
-          final List<DatabaseChangeEvent> snapshot = await initialEvents();
-          for (final DatabaseChangeEvent event in snapshot) {
-            controller.add(event);
-          }
-        } catch (error, stackTrace) {
-          controller.addError(error, stackTrace);
-        } finally {
-          snapshotDone = true;
-          for (final DatabaseChangeEvent event in queued) {
-            controller.add(event);
-          }
-          queued.clear();
+      controller
+        ..onCancel = () {
+          ended = true;
+          return subscription.cancel();
         }
-      });
+        ..onPause = () {
+          paused = true;
+        }
+        ..onResume = () {
+          paused = false;
+          drain();
+        };
+
+      if (initialEvents != null) {
+        Future<void>(() async {
+          try {
+            final List<DatabaseChangeEvent> snapshot = await initialEvents();
+            for (final DatabaseChangeEvent event in snapshot) {
+              if (ended) return;
+              controller.add(event);
+            }
+          } catch (error, stackTrace) {
+            if (!ended) controller.addError(error, stackTrace);
+          } finally {
+            snapshotDone = true;
+            drain();
+          }
+        });
+      }
     });
   }
 

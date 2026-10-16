@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
+
 import 'package:reaxdb_dart/src/core/encryption/encryption_config.dart';
 import 'package:reaxdb_dart/src/core/encryption/encryption_engine.dart';
 import 'package:reaxdb_dart/src/core/logging/file_log_output.dart';
@@ -146,6 +148,32 @@ void main() {
       // Deterministic for correlation, distinct for different keys.
       expect(Redaction.key(pii), redacted);
       expect(Redaction.key('other-key'), isNot(redacted));
+    });
+
+    test('Redaction.key is keyed, not a plain SHA-256 prefix', () {
+      // An unkeyed hash lets anyone hash candidate emails and match them
+      // against a log. The fingerprint must not be recomputable that way.
+      const String pii = 'user:davidvillegas15@gmail.com';
+      final String plainSha = sha256
+          .convert(utf8.encode(pii))
+          .bytes
+          .take(4)
+          .map((int b) => b.toRadixString(16).padLeft(2, '0'))
+          .join();
+      final String redacted = Redaction.key(pii);
+      expect(redacted, matches(RegExp(r'^key#[0-9a-f]{8}\(len=\d+\)$')));
+      expect(redacted, isNot(contains(plainSha)));
+      // Stable for the lifetime of the isolate.
+      for (int i = 0; i < 100; i++) {
+        expect(Redaction.key(pii), redacted);
+      }
+    });
+
+    test('Redaction.key fingerprints are well distributed', () {
+      final Set<String> fingerprints = <String>{
+        for (int i = 0; i < 200; i++) Redaction.key('user:$i@example.com'),
+      };
+      expect(fingerprints, hasLength(200));
     });
 
     test('Redaction.keyBytes matches key for the same UTF-8 bytes', () {

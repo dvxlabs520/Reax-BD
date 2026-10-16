@@ -74,10 +74,9 @@ class QueryBuilder {
   /// Creates a query over [collection].
   QueryBuilder({
     required this.collection,
-    required DocumentStore store,
-    IndexManager? indexManager,
-  }) : _store = store,
-       _indexManager = indexManager;
+    required this._store,
+    this._indexManager,
+  });
 
   /// The collection this query targets.
   final String collection;
@@ -224,7 +223,9 @@ class QueryBuilder {
 
   /// Counts matching documents without materializing the result list.
   ///
-  /// With no conditions this only iterates ids and never decodes documents.
+  /// With no conditions this only iterates keys and never decodes documents.
+  /// With conditions every candidate document is loaded and checked, so the
+  /// cost is that of the equivalent [find] minus the result list.
   Future<int> count() async {
     if (_conditions.isEmpty && _textSearchQuery == null) {
       int total = 0;
@@ -301,20 +302,23 @@ class QueryBuilder {
   }
 
   /// Streams matching records (unordered, no offset/limit applied).
+  ///
+  /// On the index path candidates are consumed lazily and loaded in chunks,
+  /// so a caller that stops early (a `limit` without `orderBy`, `findOne`)
+  /// also stops the index scan.
   Stream<DocumentRecord> _matchingRecords() async* {
-    Set<String>? candidates;
     final IndexManager? indexManager = _indexManager;
-    if (indexManager != null && _conditions.isNotEmpty) {
-      candidates = await indexManager.candidateIds(collection, _conditions);
-    }
+    final Stream<List<String>>? candidates =
+        indexManager != null && _conditions.isNotEmpty
+        ? indexManager.candidateIdChunks(collection, _conditions)
+        : null;
     if (candidates != null) {
-      for (final String id in candidates) {
-        final Map<String, dynamic>? doc = await _store.getDocument(
+      await for (final List<String> chunk in candidates) {
+        for (final DocumentRecord record in await _store.getDocuments(
           collection,
-          id,
-        );
-        if (doc != null && _matches(doc)) {
-          yield DocumentRecord(id, doc);
+          chunk,
+        )) {
+          if (_matches(record.document)) yield record;
         }
       }
     } else {
@@ -335,8 +339,9 @@ class QueryBuilder {
     final List<DocumentRecord> matched = [];
     final bool canTerminateEarly =
         _orderByField == null && effectiveLimit != null;
-    final int? stopAt =
-        canTerminateEarly ? effectiveOffset + effectiveLimit : null;
+    final int? stopAt = canTerminateEarly
+        ? effectiveOffset + effectiveLimit
+        : null;
 
     await for (final DocumentRecord record in _matchingRecords()) {
       matched.add(record);

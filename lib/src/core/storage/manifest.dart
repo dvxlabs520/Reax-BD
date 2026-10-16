@@ -13,8 +13,10 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import '../errors/exceptions.dart';
+import '../platform/native_io.dart';
 import '../util/record_codec.dart';
 import '../util/varint.dart';
+import 'io_faults.dart';
 
 /// Immutable snapshot of LSM tree membership.
 final class ManifestState {
@@ -134,7 +136,8 @@ final class Manifest {
   /// Atomically replaces the on-disk manifest with [newState].
   ///
   /// The new content is fully written and fsynced to a temporary file before
-  /// being renamed over the old manifest.
+  /// being renamed over the old manifest. On failure the temporary file is
+  /// removed, the previous manifest stays in force and [state] is unchanged.
   Future<void> update(ManifestState newState) async {
     final payload = BytesBuilder(copy: false);
     Varint.write(payload, newState.nextTableId);
@@ -150,11 +153,33 @@ final class Manifest {
     RecordCodec.writeRecord(buf, payload.takeBytes());
 
     final tmpPath = p.join(_directory, '$_fileName.tmp');
-    final raf = await File(tmpPath).open(mode: FileMode.write);
-    await raf.writeFrom(buf.takeBytes());
-    await raf.flush();
-    await raf.close();
-    await File(tmpPath).rename(p.join(_directory, _fileName));
+    try {
+      final raf = await File(tmpPath).open(mode: FileMode.write);
+      try {
+        await IoFaults.write(raf, buf.takeBytes(), IoOp.manifestWrite, tmpPath);
+        await raf.flush();
+      } finally {
+        await raf.close();
+      }
+      IoFaults.check(IoOp.manifestRename, tmpPath);
+      // The rename is atomic; fsyncing the directory makes it durable before
+      // the caller checkpoints the WAL (no-op where unavailable, see
+      // [syncDirectory]).
+      await File(tmpPath).rename(p.join(_directory, _fileName));
+      syncDirectory(_directory);
+    } catch (_) {
+      await _deleteQuietly(tmpPath);
+      rethrow;
+    }
     _state = newState;
+  }
+
+  static Future<void> _deleteQuietly(String path) async {
+    try {
+      final f = File(path);
+      if (await f.exists()) await f.delete();
+    } catch (_) {
+      // Best effort: a leftover temp file is discarded on the next open.
+    }
   }
 }

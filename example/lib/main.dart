@@ -178,7 +178,7 @@ class HomeScreen extends StatelessWidget {
       body: ListView.separated(
         padding: const EdgeInsets.all(16),
         itemCount: demos.length,
-        separatorBuilder: (_, __) => const SizedBox(height: 8),
+        separatorBuilder: (_, _) => const SizedBox(height: 8),
         itemBuilder: (BuildContext context, int index) {
           final Demo demo = demos[index];
           return Card(

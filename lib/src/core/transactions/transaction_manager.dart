@@ -63,8 +63,8 @@ final class Transaction {
   Transaction._({
     required this.id,
     required this.isolationLevel,
-    required TransactionManager manager,
-  }) : _manager = manager;
+    required this._manager,
+  });
 
   /// Monotonically increasing transaction identifier (lower id = older).
   final int id;
@@ -127,9 +127,10 @@ final class Transaction {
         _readSet[key] = value;
         return value;
       case IsolationLevel.optimistic:
-        final Uint8List? value = await _manager._readCommitted(key);
+        // The version is taken BEFORE the read: a commit that lands while the
+        // read is in flight must make validation fail, not slip past it.
         _accessVersions.putIfAbsent(key, () => _manager._versionOf(key));
-        return value;
+        return _manager._readCommitted(key);
     }
   }
 
@@ -167,6 +168,32 @@ final class Transaction {
   }
 }
 
+/// Hooks that let the database facade run a commit inside its own write
+/// pipeline.
+///
+/// Without a pipeline a commit writes the transaction's values in one
+/// [StorageEngine.writeBatch] and nothing else. With one, the commit runs
+/// inside [exclusive] (so no other write of the facade can interleave with
+/// validation and the batch), appends [extraOps] (secondary index
+/// maintenance) to the SAME atomic batch, and calls [afterCommit] (cache and
+/// change events) before the exclusive section ends.
+abstract interface class CommitPipeline {
+  /// Runs [action] while no other pipeline write can run.
+  Future<T> exclusive<T>(Future<T> Function() action);
+
+  /// Extra operations committed atomically with the transaction's values.
+  Future<List<WriteOp>> extraOps(List<AppliedOperation> applied);
+
+  /// Called once the batch is durable, still inside [exclusive].
+  ///
+  /// Errors thrown here are reported to [onAfterCommitError] and never turn a
+  /// durable commit into a failure.
+  void afterCommit(CommitResult result);
+
+  /// Receives an error thrown by [afterCommit].
+  void onAfterCommitError(Object error, StackTrace stack);
+}
+
 /// Creates, commits and aborts [Transaction]s over a [StorageEngine].
 ///
 /// Commit applies the whole write set through a single
@@ -181,20 +208,22 @@ final class TransactionManager {
   /// detected immediately and do not wait for this backstop).
   TransactionManager({
     required StorageEngine storageEngine,
-    IsolationLevel defaultIsolationLevel = IsolationLevel.readCommitted,
+    this._defaultIsolationLevel = IsolationLevel.readCommitted,
     Duration lockTimeout = const Duration(seconds: 10),
+    this._pipeline,
   }) : _engine = storageEngine,
-       _defaultIsolationLevel = defaultIsolationLevel,
        _lockManager = LockManager(defaultTimeout: lockTimeout);
 
   final StorageEngine _engine;
+  final CommitPipeline? _pipeline;
   final IsolationLevel _defaultIsolationLevel;
   final LockManager _lockManager;
   final _AsyncMutex _commitMutex = _AsyncMutex();
 
   final Map<int, Transaction> _active = <int, Transaction>{};
 
-  /// Version stamp per key, bumped on every committed write. Used by
+  /// Version stamp per key, bumped on every committed write and on every
+  /// non-transactional write reported through [noteExternalWrites]. Used by
   /// optimistic validation; cleared whenever no transaction is active so it
   /// cannot grow without bound.
   final Map<String, int> _keyVersions = <String, int>{};
@@ -249,62 +278,83 @@ final class TransactionManager {
     }
     tx._state = TransactionState.preparing;
     try {
-      final CommitResult result = await _commitMutex.run(() async {
-        switch (tx.isolationLevel) {
-          case IsolationLevel.readCommitted:
-            break;
-          case IsolationLevel.repeatableRead:
-          case IsolationLevel.serializable:
-            await _validateReadSet(tx);
-          case IsolationLevel.optimistic:
-            _validateVersions(tx);
-        }
-
-        final List<AppliedOperation> applied = <AppliedOperation>[];
-        final List<WriteOp> ops = <WriteOp>[];
-        for (final MapEntry<String, _PendingWrite> entry
-            in tx._writeSet.entries) {
-          final Uint8List keyBytes = _keyBytes(entry.key);
-          final Uint8List? oldValue = await _engine.get(keyBytes);
-          if (entry.value.isDelete) {
-            ops.add(WriteOp.delete(keyBytes));
-            applied.add(
-              AppliedOperation(
-                type: AppliedOperationType.delete,
-                key: entry.key,
-                oldValue: oldValue,
-                newValue: null,
-              ),
-            );
-          } else {
-            final Uint8List value = entry.value.value!;
-            ops.add(WriteOp.put(keyBytes, value));
-            applied.add(
-              AppliedOperation(
-                type: AppliedOperationType.put,
-                key: entry.key,
-                oldValue: oldValue,
-                newValue: value,
-              ),
-            );
+      final CommitResult result = await _commitMutex.run(
+        () => _exclusive(() async {
+          switch (tx.isolationLevel) {
+            case IsolationLevel.readCommitted:
+              break;
+            case IsolationLevel.repeatableRead:
+            case IsolationLevel.serializable:
+              await _validateReadSet(tx);
+            case IsolationLevel.optimistic:
+              _validateVersions(tx);
           }
-        }
 
-        if (ops.isNotEmpty) {
-          await _engine.writeBatch(ops, transactionId: tx.id);
-          for (final String key in tx._writeSet.keys) {
-            _keyVersions[key] = ++_versionCounter;
+          final List<AppliedOperation> applied = <AppliedOperation>[];
+          final List<WriteOp> ops = <WriteOp>[];
+          for (final MapEntry<String, _PendingWrite> entry
+              in tx._writeSet.entries) {
+            final Uint8List keyBytes = _keyBytes(entry.key);
+            final Uint8List? oldValue = await _engine.get(keyBytes);
+            if (entry.value.isDelete) {
+              ops.add(WriteOp.delete(keyBytes));
+              applied.add(
+                AppliedOperation(
+                  type: AppliedOperationType.delete,
+                  key: entry.key,
+                  oldValue: oldValue,
+                  newValue: null,
+                ),
+              );
+            } else {
+              final Uint8List value = entry.value.value!;
+              ops.add(WriteOp.put(keyBytes, value));
+              applied.add(
+                AppliedOperation(
+                  type: AppliedOperationType.put,
+                  key: entry.key,
+                  oldValue: oldValue,
+                  newValue: value,
+                ),
+              );
+            }
           }
-        }
 
-        tx._state = TransactionState.committed;
-        _committedCount++;
-        return CommitResult(transactionId: tx.id, operations: applied);
-      });
+          final CommitPipeline? pipeline = _pipeline;
+          if (ops.isNotEmpty) {
+            if (pipeline != null) {
+              // Index maintenance rides in the same atomic batch, so a crash
+              // can never leave a committed document without its postings.
+              ops.addAll(await pipeline.extraOps(applied));
+            }
+            await _engine.writeBatch(ops, transactionId: tx.id);
+            for (final String key in tx._writeSet.keys) {
+              _keyVersions[key] = ++_versionCounter;
+            }
+          }
+
+          tx._state = TransactionState.committed;
+          _committedCount++;
+          final CommitResult committed = CommitResult(
+            transactionId: tx.id,
+            operations: applied,
+          );
+          if (pipeline != null && applied.isNotEmpty) {
+            try {
+              pipeline.afterCommit(committed);
+            } catch (error, stack) {
+              pipeline.onAfterCommitError(error, stack);
+            }
+          }
+          return committed;
+        }),
+      );
       return result;
     } catch (_) {
-      tx._state = TransactionState.aborted;
-      _abortedCount++;
+      if (tx._state != TransactionState.committed) {
+        tx._state = TransactionState.aborted;
+        _abortedCount++;
+      }
       rethrow;
     } finally {
       _lockManager.releaseAll(tx.id);
@@ -382,7 +432,24 @@ final class TransactionManager {
     }
   }
 
+  /// Records that [keys] were written outside any transaction.
+  ///
+  /// Optimistic transactions validate against key versions; a plain write
+  /// must bump them too, or an optimistic commit would silently overwrite
+  /// it (a lost update).
+  void noteExternalWrites(Iterable<String> keys) {
+    if (_active.isEmpty) return;
+    for (final String key in keys) {
+      _keyVersions[key] = ++_versionCounter;
+    }
+  }
+
   // -- internals ----------------------------------------------------------
+
+  Future<T> _exclusive<T>(Future<T> Function() action) {
+    final CommitPipeline? pipeline = _pipeline;
+    return pipeline == null ? action() : pipeline.exclusive<T>(action);
+  }
 
   Uint8List _keyBytes(String key) => Uint8List.fromList(utf8.encode(key));
 

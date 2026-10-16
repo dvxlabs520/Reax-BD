@@ -77,17 +77,15 @@ void main() {
             SSTableEntry(_b(k), _b('v$k')),
         ],
       );
-      final forward =
-          await table
-              .range(startKey: _b('b'), endKey: _b('e'))
-              .map((e) => utf8.decode(e.key))
-              .toList();
+      final forward = await table
+          .range(startKey: _b('b'), endKey: _b('e'))
+          .map((e) => utf8.decode(e.key))
+          .toList();
       expect(forward, ['b', 'c', 'd']);
-      final reversed =
-          await table
-              .range(startKey: _b('b'), endKey: _b('e'), reverse: true)
-              .map((e) => utf8.decode(e.key))
-              .toList();
+      final reversed = await table
+          .range(startKey: _b('b'), endKey: _b('e'), reverse: true)
+          .map((e) => utf8.decode(e.key))
+          .toList();
       expect(reversed, ['d', 'c', 'b']);
       await table.close();
     });

@@ -103,8 +103,9 @@ void main() {
         archivePath: archive,
         path: at('ttl-restored'),
       );
-      final List<ReaxEntry<String>> entries =
-          await restored.scan<String>().toList();
+      final List<ReaxEntry<String>> entries = await restored
+          .scan<String>()
+          .toList();
       expect(entries.single.expiresAt, isNotNull);
       await restored.close();
     });
@@ -294,10 +295,9 @@ Future<void> main() async {
             await db
                     .query('products')
                     .aggregate(
-                      (AggregationBuilder b) =>
-                          b
-                            ..sum('price')
-                            ..count(),
+                      (AggregationBuilder b) => b
+                        ..sum('price')
+                        ..count(),
                     )
                     .executeAggregation()
                 as Map<String, AggregationResult>;
@@ -342,8 +342,10 @@ Future<void> main() async {
       await db.compact();
 
       expect(await db.query('doc').count(), 200);
-      final List<Map<String, dynamic>> bucketZero =
-          await db.query('doc').whereEquals('bucket', 0).find();
+      final List<Map<String, dynamic>> bucketZero = await db
+          .query('doc')
+          .whereEquals('bucket', 0)
+          .find();
       for (final Map<String, dynamic> doc in bucketZero) {
         expect((doc['i'] as int) % 5, 0);
         expect((doc['i'] as int) % 3, isNot(0));

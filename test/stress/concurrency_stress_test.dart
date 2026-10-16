@@ -249,13 +249,12 @@ void main() {
         int scans = 0;
         while (compacting && scans < 2000) {
           try {
-            final List<ReaxEntry<Map<String, dynamic>>> entries =
-                await db
-                    .scan<Map<String, dynamic>>(
-                      startKey: 's:000100',
-                      endKey: 's:000200',
-                    )
-                    .toList();
+            final List<ReaxEntry<Map<String, dynamic>>> entries = await db
+                .scan<Map<String, dynamic>>(
+                  startKey: 's:000100',
+                  endKey: 's:000200',
+                )
+                .toList();
             if (entries.length != 100) {
               problems.add('scan returned ${entries.length} entries, want 100');
             }
@@ -298,10 +297,10 @@ void main() {
           // really do contend and can deadlock if locking is wrong.
           final String from = 'acct:${i % accounts}';
           final String to = 'acct:${(i + 1) % accounts}';
-          final Map<String, dynamic> source =
-              (await tx.get<Map<String, dynamic>>(from))!;
-          final Map<String, dynamic> target =
-              (await tx.get<Map<String, dynamic>>(to))!;
+          final Map<String, dynamic> source = (await tx
+              .get<Map<String, dynamic>>(from))!;
+          final Map<String, dynamic> target = (await tx
+              .get<Map<String, dynamic>>(to))!;
           final int balance = source['balance'] as int;
           if (balance < 1) return;
           await tx.put(from, <String, dynamic>{'balance': balance - 1});
@@ -339,8 +338,8 @@ void main() {
 
       int total = 0;
       for (int a = 0; a < accounts; a++) {
-        final Map<String, dynamic> account =
-            (await db.get<Map<String, dynamic>>('acct:$a'))!;
+        final Map<String, dynamic> account = (await db
+            .get<Map<String, dynamic>>('acct:$a'))!;
         final int balance = account['balance'] as int;
         expect(balance, greaterThanOrEqualTo(0));
         total += balance;
@@ -370,8 +369,8 @@ void main() {
               db
                   .transaction<void>(
                     (ReaxTransaction tx) async {
-                      final Map<String, dynamic> current =
-                          (await tx.get<Map<String, dynamic>>('counter'))!;
+                      final Map<String, dynamic> current = (await tx
+                          .get<Map<String, dynamic>>('counter'))!;
                       await tx.put('counter', <String, dynamic>{
                         'n': (current['n'] as int) + 1,
                       });
@@ -395,8 +394,8 @@ void main() {
           );
         }
         expect(committed, greaterThan(0));
-        final Map<String, dynamic> counter =
-            (await db.get<Map<String, dynamic>>('counter'))!;
+        final Map<String, dynamic> counter = (await db
+            .get<Map<String, dynamic>>('counter'))!;
         expect(
           counter['n'],
           committed,
@@ -421,8 +420,8 @@ void main() {
           for (int i = 0; i < 50; i++)
             db
                 .transaction<void>((ReaxTransaction tx) async {
-                  final Map<String, dynamic> current =
-                      (await tx.get<Map<String, dynamic>>('rc'))!;
+                  final Map<String, dynamic> current = (await tx
+                      .get<Map<String, dynamic>>('rc'))!;
                   await tx.put('rc', <String, dynamic>{
                     'n': (current['n'] as int) + 1,
                   });
@@ -435,8 +434,9 @@ void main() {
         expect(failure, isA<ReaxDbException>());
       }
       final int committed = outcomes.where((Object? o) => o == null).length;
-      final Map<String, dynamic> counter =
-          (await db.get<Map<String, dynamic>>('rc'))!;
+      final Map<String, dynamic> counter = (await db.get<Map<String, dynamic>>(
+        'rc',
+      ))!;
       expect(counter['n'], greaterThanOrEqualTo(1));
       expect(counter['n'], lessThanOrEqualTo(committed));
       await db.close();

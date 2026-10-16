@@ -142,8 +142,10 @@ void main() {
         // Crash before txCommit: abandon without close (full sync mode has
         // already made these records durable).
         final recovered = await WriteAheadLog.open(directory: dir.path);
-        final keys =
-            await recovered.replay().map((e) => utf8.decode(e.key!)).toList();
+        final keys = await recovered
+            .replay()
+            .map((e) => utf8.decode(e.key!))
+            .toList();
         expect(keys, ['safe']);
         await recovered.close();
       },

@@ -318,11 +318,10 @@ void main() {
   group('LegacyDecryptor', () {
     test('reproduces the 1.x AES key derivation', () {
       const String password = 'super-secret-legacy-key-2025';
-      List<int> digest =
-          sha256.convert(<int>[
-            ...utf8.encode(password),
-            ...utf8.encode('ReaxDB_Salt_v1_2025'),
-          ]).bytes;
+      List<int> digest = sha256.convert(<int>[
+        ...utf8.encode(password),
+        ...utf8.encode('ReaxDB_Salt_v1_2025'),
+      ]).bytes;
       for (int i = 0; i < 10000; i++) {
         digest = sha256.convert(digest).bytes;
       }

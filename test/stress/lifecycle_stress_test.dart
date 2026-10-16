@@ -81,8 +81,9 @@ void main() {
         expect(index.isOdd, isTrue, reason: '$key is expired but was listed');
       }
 
-      final List<ReaxEntry<Map<String, dynamic>>> scanned =
-          await db.scan<Map<String, dynamic>>(startKey: 'ttl:').toList();
+      final List<ReaxEntry<Map<String, dynamic>>> scanned = await db
+          .scan<Map<String, dynamic>>(startKey: 'ttl:')
+          .toList();
       expect(scanned.length, each);
 
       await db.close();

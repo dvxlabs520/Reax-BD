@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:reaxdb_dart/src/core/encryption/encryption_config.dart';
 import 'package:reaxdb_dart/src/core/encryption/encryption_engine.dart';
+import 'package:reaxdb_dart/src/core/encryption/encryption_type.dart';
 import 'package:reaxdb_dart/src/core/encryption/key_derivation.dart';
 import 'package:reaxdb_dart/src/core/errors/exceptions.dart';
 import 'package:test/test.dart';
@@ -342,6 +344,343 @@ void main() {
     });
   });
 
+  group('associated data (envelope version 2)', () {
+    final Uint8List alice = Uint8List.fromList(utf8.encode('role:alice'));
+    final Uint8List mallory = Uint8List.fromList(utf8.encode('role:mallory'));
+
+    test('new AES values are written as version 2', () {
+      final Uint8List ciphertext = aesEngine().encrypt(
+        plaintext,
+        associatedData: alice,
+      );
+      expect(ciphertext[0], EncryptionEngine.envelopeVersion2);
+      expect(EncryptionEngine.envelopeVersionOf(ciphertext), 0x02);
+      expect(ciphertext.length, 2 + 12 + plaintext.length + 16);
+    });
+
+    test('round-trips with the same associated data', () {
+      final EncryptionEngine engine = aesEngine();
+      final Uint8List ciphertext = engine.encrypt(
+        plaintext,
+        associatedData: alice,
+      );
+      expect(
+        engine.decrypt(ciphertext, associatedData: alice),
+        equals(plaintext),
+      );
+      // An equal but distinct buffer works too: only the bytes matter.
+      expect(
+        engine.decrypt(ciphertext, associatedData: Uint8List.fromList(alice)),
+        equals(plaintext),
+      );
+    });
+
+    test('a ciphertext swapped onto another key fails to decrypt', () {
+      final EncryptionEngine engine = aesEngine();
+      final Uint8List aliceValue = engine.encrypt(
+        plaintext,
+        associatedData: alice,
+      );
+      expect(
+        () => engine.decrypt(aliceValue, associatedData: mallory),
+        throwsA(isA<EncryptionException>()),
+      );
+      expect(
+        () => engine.decrypt(aliceValue),
+        throwsA(isA<EncryptionException>()),
+        reason: 'missing associated data must not authenticate either',
+      );
+    });
+
+    test('null and empty associated data are equivalent', () {
+      final EncryptionEngine engine = aesEngine();
+      final Uint8List ciphertext = engine.encrypt(plaintext);
+      expect(
+        engine.decrypt(ciphertext, associatedData: Uint8List(0)),
+        equals(plaintext),
+      );
+      expect(
+        () => engine.decrypt(ciphertext, associatedData: alice),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+
+    test('relabelling a version 2 envelope as version 1 fails', () {
+      final EncryptionEngine engine = aesEngine();
+      final Uint8List downgraded = Uint8List.fromList(
+        engine.encrypt(plaintext, associatedData: alice),
+      )..[0] = EncryptionEngine.envelopeVersion1;
+      expect(
+        () => engine.decrypt(downgraded, associatedData: alice),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+
+    test('obfuscation ignores associated data and keeps version 1', () {
+      final EncryptionEngine engine = EncryptionEngine(
+        EncryptionConfig.obfuscation(
+          key: Uint8List.fromList(utf8.encode('k1')),
+        ),
+      );
+      final Uint8List ciphertext = engine.encrypt(
+        plaintext,
+        associatedData: alice,
+      );
+      expect(ciphertext[0], EncryptionEngine.envelopeVersion1);
+      expect(
+        engine.decrypt(ciphertext, associatedData: mallory),
+        equals(plaintext),
+      );
+    });
+  });
+
+  group('version 1 envelopes (ReaxDB 2.0.0)', () {
+    // Produced by the unmodified 2.0.0 EncryptionEngine with the raw key
+    // 0x00..0x1f; plaintext 'written by reaxdb 2.0.0'.
+    const String v1Vector =
+        'AQKXaoNsifo5FN8mUpPqCfcPm67YHbxuhnVuhoTn2XoyH7uIYvFb9PDF6RrplItI99uI1Pc=';
+    final Uint8List expectedPlaintext = Uint8List.fromList(
+      utf8.encode('written by reaxdb 2.0.0'),
+    );
+
+    test('a 2.0.0 ciphertext still decrypts', () {
+      final Uint8List stored = base64Decode(v1Vector);
+      expect(EncryptionEngine.envelopeVersionOf(stored), 0x01);
+      expect(aesEngine().decrypt(stored), equals(expectedPlaintext));
+    });
+
+    test('associated data is ignored for version 1 envelopes', () {
+      expect(
+        aesEngine().decrypt(
+          base64Decode(v1Vector),
+          associatedData: Uint8List.fromList(utf8.encode('any:key')),
+        ),
+        equals(expectedPlaintext),
+      );
+    });
+
+    test('a tampered version 1 envelope still fails authentication', () {
+      final Uint8List stored = base64Decode(v1Vector);
+      stored[stored.length - 1] ^= 0x01;
+      expect(
+        () => aesEngine().decrypt(stored),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+
+    test('obfuscation rejects a version 2 envelope', () {
+      final Uint8List data = Uint8List.fromList(<int>[
+        EncryptionEngine.envelopeVersion2,
+        EncryptionEngine.algorithmIdObfuscation,
+        1,
+        2,
+      ]);
+      expect(
+        () => EncryptionEngine(
+          EncryptionConfig.obfuscation(key: Uint8List.fromList(<int>[7])),
+        ).decrypt(data),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+  });
+
+  group('key check', () {
+    EncryptionEngine passphraseEngine(String passphrase) => EncryptionEngine(
+      EncryptionConfig.aes256FromPassphrase(
+        passphrase: passphrase,
+        iterations: KeyDerivation.minIterations,
+      ),
+      kdfSalt: salt,
+    );
+
+    test('the right passphrase verifies, a wrong one does not', () {
+      final Uint8List token = passphraseEngine('right').createKeyCheck();
+      expect(token, hasLength(EncryptionEngine.keyCheckLength));
+      expect(passphraseEngine('right').verifyKeyCheck(token), isTrue);
+      expect(passphraseEngine('wrong').verifyKeyCheck(token), isFalse);
+    });
+
+    test('a raw key verifies and a different raw key does not', () {
+      final Uint8List token = aesEngine().createKeyCheck();
+      expect(aesEngine().verifyKeyCheck(token), isTrue);
+      final EncryptionEngine other = EncryptionEngine(
+        EncryptionConfig.aes256(key: Uint8List(32)),
+      );
+      expect(other.verifyKeyCheck(token), isFalse);
+    });
+
+    test('the token is deterministic and does not contain the key', () {
+      final Uint8List a = aesEngine().createKeyCheck();
+      final Uint8List b = aesEngine().createKeyCheck();
+      expect(a, equals(b));
+      expect(base64Encode(a), isNot(contains(base64Encode(rawKey))));
+      for (int i = 0; i + 4 <= rawKey.length; i++) {
+        final List<int> window = rawKey.sublist(i, i + 4);
+        for (int j = 0; j + 4 <= a.length; j++) {
+          expect(a.sublist(j, j + 4), isNot(equals(window)));
+        }
+      }
+    });
+
+    test('a flipped token bit is a mismatch, not an exception', () {
+      final Uint8List token = aesEngine().createKeyCheck();
+      token[token.length - 1] ^= 0x01;
+      expect(aesEngine().verifyKeyCheck(token), isFalse);
+    });
+
+    test('obfuscation key check distinguishes keys', () {
+      EncryptionEngine obf(String key) => EncryptionEngine(
+        EncryptionConfig.obfuscation(key: Uint8List.fromList(utf8.encode(key))),
+      );
+      final Uint8List token = obf('alpha').createKeyCheck();
+      expect(obf('alpha').verifyKeyCheck(token), isTrue);
+      expect(obf('bravo').verifyKeyCheck(token), isFalse);
+    });
+
+    test('a token from another algorithm is a mismatch', () {
+      final Uint8List obfToken = EncryptionEngine(
+        EncryptionConfig.obfuscation(key: rawKey),
+      ).createKeyCheck();
+      expect(aesEngine().verifyKeyCheck(obfToken), isFalse);
+      expect(
+        EncryptionEngine(
+          EncryptionConfig.obfuscation(key: rawKey),
+        ).verifyKeyCheck(aesEngine().createKeyCheck()),
+        isFalse,
+      );
+    });
+
+    test('no encryption uses an empty token', () {
+      final EncryptionEngine none = EncryptionEngine(
+        const EncryptionConfig.none(),
+      );
+      expect(none.createKeyCheck(), isEmpty);
+      expect(none.verifyKeyCheck(Uint8List(0)), isTrue);
+      expect(none.verifyKeyCheck(aesEngine().createKeyCheck()), isFalse);
+    });
+
+    test('a malformed token throws EncryptionException', () {
+      final EncryptionEngine engine = aesEngine();
+      expect(
+        () => engine.verifyKeyCheck(Uint8List(0)),
+        throwsA(isA<EncryptionException>()),
+      );
+      expect(
+        () => engine.verifyKeyCheck(Uint8List(10)),
+        throwsA(isA<EncryptionException>()),
+      );
+      final Uint8List badVersion = engine.createKeyCheck()..[0] = 0x7F;
+      expect(
+        () => engine.verifyKeyCheck(badVersion),
+        throwsA(isA<EncryptionException>()),
+      );
+      final Uint8List badAlgorithm = engine.createKeyCheck()..[1] = 0x7F;
+      expect(
+        () => engine.verifyKeyCheck(badAlgorithm),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+  });
+
+  group('EncryptionEngine.create', () {
+    test('produces an engine interoperable with the sync factory', () async {
+      final EncryptionConfig config = EncryptionConfig.aes256FromPassphrase(
+        passphrase: 'interop passphrase',
+        iterations: KeyDerivation.minIterations,
+      );
+      final EncryptionEngine sync = EncryptionEngine(config, kdfSalt: salt);
+      final EncryptionEngine async = await EncryptionEngine.create(
+        config,
+        kdfSalt: salt,
+      );
+      final Uint8List ad = Uint8List.fromList(utf8.encode('k'));
+      expect(
+        async.decrypt(
+          sync.encrypt(plaintext, associatedData: ad),
+          associatedData: ad,
+        ),
+        equals(plaintext),
+      );
+      expect(
+        sync.decrypt(
+          async.encrypt(plaintext, associatedData: ad),
+          associatedData: ad,
+        ),
+        equals(plaintext),
+      );
+      expect(async.createKeyCheck(), equals(sync.createKeyCheck()));
+      expect(async.type, sync.type);
+    });
+
+    test('derives the key without blocking the calling isolate', () async {
+      int ticks = 0;
+      final Timer timer = Timer.periodic(
+        const Duration(milliseconds: 2),
+        (_) => ticks++,
+      );
+      try {
+        await EncryptionEngine.create(
+          EncryptionConfig.aes256FromPassphrase(passphrase: 'slow'),
+          kdfSalt: salt,
+        );
+      } finally {
+        timer.cancel();
+      }
+      // A synchronous 210,000-round PBKDF2 would starve the timer entirely.
+      expect(ticks, greaterThan(5));
+    });
+
+    test('raises the same errors as the sync factory', () async {
+      await expectLater(
+        EncryptionEngine.create(
+          EncryptionConfig.aes256FromPassphrase(
+            passphrase: 'no salt',
+            iterations: KeyDerivation.minIterations,
+          ),
+        ),
+        throwsA(isA<EncryptionException>()),
+      );
+      await expectLater(
+        EncryptionEngine.create(
+          EncryptionConfig.aes256FromPassphrase(
+            passphrase: 'tiny salt',
+            iterations: KeyDerivation.minIterations,
+          ),
+          kdfSalt: Uint8List(4),
+        ),
+        throwsA(isA<EncryptionException>()),
+      );
+    });
+
+    test('non-passphrase configurations match the sync factory', () async {
+      final EncryptionEngine raw = await EncryptionEngine.create(
+        EncryptionConfig.aes256(key: rawKey),
+      );
+      expect(aesEngine().decrypt(raw.encrypt(plaintext)), equals(plaintext));
+      final EncryptionEngine none = await EncryptionEngine.create(
+        const EncryptionConfig.none(),
+      );
+      expect(none.type, EncryptionType.none);
+    });
+
+    test('deriveKeyInBackground matches deriveKey', () async {
+      expect(
+        await KeyDerivation.deriveKeyInBackground(
+          passphrase: 'p@ss',
+          salt: salt,
+          iterations: KeyDerivation.minIterations,
+        ),
+        equals(
+          KeyDerivation.deriveKey(
+            passphrase: 'p@ss',
+            salt: salt,
+            iterations: KeyDerivation.minIterations,
+          ),
+        ),
+      );
+    });
+  });
+
   group('metadata honesty', () {
     test('aes256 reports high security and authentication', () {
       final Map<String, dynamic> meta = aesEngine().getMetadata();
@@ -355,12 +694,11 @@ void main() {
     });
 
     test('obfuscation reports it is not secure', () {
-      final Map<String, dynamic> meta =
-          EncryptionEngine(
-            EncryptionConfig.obfuscation(
-              key: Uint8List.fromList(utf8.encode('k1')),
-            ),
-          ).getMetadata();
+      final Map<String, dynamic> meta = EncryptionEngine(
+        EncryptionConfig.obfuscation(
+          key: Uint8List.fromList(utf8.encode('k1')),
+        ),
+      ).getMetadata();
       expect(meta['type'], 'obfuscation');
       expect(meta['is_secure'], isFalse);
       expect(meta['is_authenticated'], isFalse);
@@ -375,8 +713,9 @@ void main() {
     });
 
     test('none reports disabled', () {
-      final Map<String, dynamic> meta =
-          EncryptionEngine(const EncryptionConfig.none()).getMetadata();
+      final Map<String, dynamic> meta = EncryptionEngine(
+        const EncryptionConfig.none(),
+      ).getMetadata();
       expect(meta['enabled'], isFalse);
       expect(meta['is_secure'], isFalse);
     });

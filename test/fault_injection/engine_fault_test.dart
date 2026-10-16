@@ -75,12 +75,11 @@ void main() {
 
         // Truncate the manifest-referenced table to simulate a torn write
         // that somehow reached its final name.
-        final sst =
-            await tablesDir()
-                .list()
-                .where((e) => e.path.endsWith('.sst'))
-                .cast<File>()
-                .first;
+        final sst = await tablesDir()
+            .list()
+            .where((e) => e.path.endsWith('.sst'))
+            .cast<File>()
+            .first;
         final bytes = await sst.readAsBytes();
         await sst.writeAsBytes(bytes.sublist(0, bytes.length ~/ 3));
 
@@ -113,12 +112,11 @@ void main() {
 
       // Simulate a compaction that wrote its output table but died before
       // publishing the manifest: a valid-looking orphan .sst appears.
-      final sst =
-          await tablesDir()
-              .list()
-              .where((e) => e.path.endsWith('.sst'))
-              .cast<File>()
-              .first;
+      final sst = await tablesDir()
+          .list()
+          .where((e) => e.path.endsWith('.sst'))
+          .cast<File>()
+          .first;
       final orphanPath = p.join(tablesDir().path, 'sst-000000000777.sst');
       await sst.copy(orphanPath);
 

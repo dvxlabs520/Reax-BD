@@ -85,6 +85,9 @@ final class LegacyFixtures {
   static const String legacySourcesRevision =
       '5a2fcc454828c0f3dcc6f5770f32846c49af0b99';
 
+  /// How many times [build] runs the generator before giving up.
+  static const int generationAttempts = 3;
+
   /// Extracts, builds and runs ReaxDB 1.4.1 to produce every fixture.
   ///
   /// Throws [StateError] with the underlying output when any step fails, so a
@@ -106,25 +109,46 @@ final class LegacyFixtures {
       rethrow;
     }
 
-    final Directory root = await Directory.systemTemp.createTemp(
-      'reaxdb_legacy_fixtures_',
-    );
-    final String outputPath = p.join(root.path, 'expected.json');
-    final ProcessResult result = await Process.run('dart', <String>[
-      'run',
-      p.join(legacyPackage.path, 'bin', 'generate_fixtures.dart'),
-      p.join(root.path, 'db'),
-      outputPath,
-    ], workingDirectory: legacyPackage.path);
-    // The extracted 1.x package is only needed for generation.
-    if (await legacyPackage.exists()) {
-      await legacyPackage.delete(recursive: true);
+    // The generator already regenerates a scenario that hit the 1.x WAL
+    // flush race (see [_generatorSource]); retrying the whole process is a
+    // second line of defence for a race it could not attribute to a
+    // scenario, for example one that fires while the process exits.
+    Directory? root;
+    String? outputPath;
+    final List<String> failures = <String>[];
+    try {
+      for (int attempt = 1; attempt <= generationAttempts; attempt++) {
+        final Directory candidate = await Directory.systemTemp.createTemp(
+          'reaxdb_legacy_fixtures_',
+        );
+        final String output = p.join(candidate.path, 'expected.json');
+        final ProcessResult result = await Process.run('dart', <String>[
+          'run',
+          p.join(legacyPackage.path, 'bin', 'generate_fixtures.dart'),
+          p.join(candidate.path, 'db'),
+          output,
+        ], workingDirectory: legacyPackage.path);
+        if (result.exitCode == 0) {
+          root = candidate;
+          outputPath = output;
+          break;
+        }
+        await candidate.delete(recursive: true);
+        failures.add(
+          'attempt $attempt (exit ${result.exitCode}):\n'
+          'stdout:\n${result.stdout}\nstderr:\n${result.stderr}',
+        );
+      }
+    } finally {
+      // The extracted 1.x package is only needed for generation.
+      if (await legacyPackage.exists()) {
+        await legacyPackage.delete(recursive: true);
+      }
     }
-    if (result.exitCode != 0) {
-      await root.delete(recursive: true);
+    if (root == null || outputPath == null) {
       throw StateError(
-        'Generating ReaxDB 1.x fixtures failed (exit ${result.exitCode}).\n'
-        'stdout:\n${result.stdout}\nstderr:\n${result.stderr}',
+        'Generating ReaxDB 1.x fixtures failed $generationAttempts times.\n'
+        '${failures.join('\n')}',
       );
     }
 
@@ -190,8 +214,10 @@ final class LegacyFixtures {
   static String _packageRoot() {
     Directory directory = Directory.current;
     while (true) {
+      // `.git` is a directory in a normal checkout and a file in a worktree.
       if (File(p.join(directory.path, 'pubspec.yaml')).existsSync() &&
-          Directory(p.join(directory.path, '.git')).existsSync()) {
+          FileSystemEntity.typeSync(p.join(directory.path, '.git')) !=
+              FileSystemEntityType.notFound) {
         return directory.path;
       }
       final Directory parent = directory.parent;
@@ -235,7 +261,20 @@ dependencies:
   /// fixture exercises 1.x WAL recovery exactly as a user's app would) and
   /// records what 1.x reads back. That readback is the ground truth the 2.x
   /// migration is compared against.
+  ///
+  /// ## The 1.x WAL flush race
+  ///
+  /// 1.4.1's `WriteAheadLog` flushes from a 1 ms `Timer` that nothing awaits
+  /// and that `_rotateLogFile`/`close` do not wait for, so now and then the
+  /// timer writes to an `IOSink` that is already closed and the process dies
+  /// with an unhandled `Bad state: StreamSink is closed`. The entries in that
+  /// flush are lost, so a scenario that hit the race does not reflect what
+  /// its code wrote. The generator does not touch the 1.x sources; instead
+  /// each scenario runs in its own error zone, waits for stray timers after
+  /// its last close, and is regenerated from an empty directory when exactly
+  /// that error was observed. Any other error still fails generation.
   static const String _generatorSource = r'''
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -467,12 +506,68 @@ Future<void> main(List<String> args) async {
   final result = <String, Map<String, Object?>>{};
   for (final entry in builders.entries) {
     final path = '${root.path}/${entry.key}';
-    await Directory(path).create(recursive: true);
-    result[entry.key] = await entry.value(path);
+    result[entry.key] = await generate(entry.key, path, entry.value);
     stderr.writeln('generated ${entry.key}');
   }
 
   await File(args[1]).writeAsString(jsonEncode(result));
+}
+
+const int maxScenarioAttempts = 8;
+
+/// The 1.4.1 bug described in LegacyFixtures._generatorSource.
+bool isWalFlushRace(Object error) =>
+    error is StateError && error.message.contains('StreamSink is closed');
+
+/// Runs [build] in its own error zone until one attempt completes without
+/// hitting the 1.x WAL flush race.
+Future<Map<String, Object?>> generate(
+  String name,
+  String path,
+  Future<Map<String, Object?>> Function(String) build,
+) async {
+  for (var attempt = 1; ; attempt++) {
+    final directory = Directory(path);
+    if (await directory.exists()) await directory.delete(recursive: true);
+    await directory.create(recursive: true);
+
+    final stray = <Object>[];
+    final done = Completer<Map<String, Object?>>();
+    runZonedGuarded(() async {
+      try {
+        final readBack = await build(path);
+        // 1.x flush timers are 1 ms (WAL) and 100 us (write buffer); give
+        // any that are still pending time to fire inside this zone before
+        // the attempt is judged.
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+        done.complete(readBack);
+      } catch (error, stack) {
+        done.completeError(error, stack);
+      }
+    }, (Object error, StackTrace stack) => stray.add(error));
+
+    Object? failure;
+    Map<String, Object?>? readBack;
+    try {
+      readBack = await done.future;
+    } catch (error) {
+      failure = error;
+    }
+    final errors = <Object>[if (failure != null) failure, ...stray];
+    if (errors.isEmpty) return readBack!;
+    final unexpected = errors.where((Object e) => !isWalFlushRace(e));
+    if (unexpected.isNotEmpty) {
+      throw StateError('scenario $name failed: ${unexpected.first}');
+    }
+    if (attempt >= maxScenarioAttempts) {
+      throw StateError(
+        'scenario $name hit the 1.x WAL flush race $attempt times in a row',
+      );
+    }
+    stderr.writeln(
+      'regenerating $name: the 1.x WAL flush race fired (attempt $attempt)',
+    );
+  }
 }
 ''';
 }

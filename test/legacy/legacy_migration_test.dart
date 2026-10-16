@@ -91,8 +91,9 @@ void main() {
     });
 
     test('counts files and live entries', () async {
-      final LegacyDatabaseInfo info =
-          (await LegacyMigration.detect(fixtures.pathOf('plain')))!;
+      final LegacyDatabaseInfo info = (await LegacyMigration.detect(
+        fixtures.pathOf('plain'),
+      ))!;
       expect(info.sstableFileCount, greaterThan(0));
       expect(info.estimatedEntryCount, fixtures.expected('plain').length);
       expect(info.looksEncrypted, isFalse);
@@ -114,8 +115,9 @@ void main() {
     });
 
     test('counts deleted keys out of the live total', () async {
-      final LegacyDatabaseInfo info =
-          (await LegacyMigration.detect(fixtures.pathOf('deletes')))!;
+      final LegacyDatabaseInfo info = (await LegacyMigration.detect(
+        fixtures.pathOf('deletes'),
+      ))!;
       expect(info.estimatedEntryCount, fixtures.expected('deletes').length);
     });
 

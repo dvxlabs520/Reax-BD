@@ -152,6 +152,19 @@ final class PipelineDocumentStore implements DocumentStore {
   }
 
   @override
+  Future<List<DocumentRecord>> getDocuments(
+    String collection,
+    List<String> ids,
+  ) async {
+    final List<DocumentRecord> found = <DocumentRecord>[];
+    for (final String id in ids) {
+      final Map<String, dynamic>? document = await getDocument(collection, id);
+      if (document != null) found.add(DocumentRecord(id, document));
+    }
+    return found;
+  }
+
+  @override
   Future<void> putDocument(
     String collection,
     String id,
@@ -217,7 +230,7 @@ buildHarness() {
   final InMemoryStorageEngine engine = InMemoryStorageEngine();
   final IndexManager indexManager = IndexManager(
     storage: engine,
-    decodeDocument: decodeJsonDocument,
+    decodeDocument: (Uint8List _, Uint8List bytes) => decodeJsonDocument(bytes),
   );
   final PipelineDocumentStore store = PipelineDocumentStore(
     engine,

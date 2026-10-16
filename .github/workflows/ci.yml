@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Flutter ${{ matrix.flutter }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The current stable release and the one before it.
+        flutter: ['3.47.7', '3.44.8']
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            flutter: '3.47.7'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ matrix.flutter }}
+          cache: true
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Check formatting
+        run: dart format --output=none --set-exit-if-changed lib test
+
+      - name: Analyze
+        run: dart analyze --fatal-infos
+
+      - name: Test
+        run: dart test
+
+      - name: Analyze the example app
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter analyze
+
+      - name: Check the package can be published
+        run: dart pub publish --dry-run

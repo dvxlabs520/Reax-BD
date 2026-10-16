@@ -48,10 +48,10 @@ final class ReaxCollection<T> {
   /// Creates a typed view of [name] backed by [db].
   const ReaxCollection({
     required this.name,
-    required ReaxDB db,
+    required this._db,
     required this.fromJson,
     required this.toJson,
-  }) : _db = db;
+  });
 
   /// The collection name, used as the key prefix.
   final String name;
@@ -100,8 +100,8 @@ final class ReaxCollection<T> {
 
   /// Streams every document of this collection in key order.
   Stream<T> all() async* {
-    await for (final ReaxEntry<Map<String, dynamic>> entry in _db
-        .scanPrefix<Map<String, dynamic>>('$name:')) {
+    await for (final ReaxEntry<Map<String, dynamic>> entry
+        in _db.scanPrefix<Map<String, dynamic>>('$name:')) {
       yield fromJson(entry.value);
     }
   }
@@ -149,8 +149,9 @@ final class ReaxCollection<T> {
   ///
   /// Pass [id] to watch a single document.
   Stream<CollectionChange<T>> watch({String? id}) {
-    final Stream<DatabaseChangeEvent> source =
-        id == null ? _db.watchCollection(name) : _db.watchKey(_key(id));
+    final Stream<DatabaseChangeEvent> source = id == null
+        ? _db.watchCollection(name)
+        : _db.watchKey(_key(id));
     return source.map((DatabaseChangeEvent event) {
       final Object? value = event.value;
       return CollectionChange<T>(

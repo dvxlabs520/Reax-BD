@@ -197,15 +197,14 @@ final class AggregationBuilder {
     switch (spec.function) {
       case AggregationFunction.count:
         final String? field = spec.field;
-        final int count =
-            field == null
-                ? documents.length
-                : documents
-                    .where(
-                      (Map<String, dynamic> doc) =>
-                          extractFieldValue(doc, field) != null,
-                    )
-                    .length;
+        final int count = field == null
+            ? documents.length
+            : documents
+                  .where(
+                    (Map<String, dynamic> doc) =>
+                        extractFieldValue(doc, field) != null,
+                  )
+                  .length;
         return AggregationResult(
           function: spec.function,
           field: spec.field,

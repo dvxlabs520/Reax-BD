@@ -3,7 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="$(rg -n '^version:' pubspec.yaml | head -1 | awk '{print $2}')"
+VERSION="$(grep -m1 '^version:' pubspec.yaml | awk '{print $2}')"
 
 echo "==> reaxdb_dart ${VERSION}"
 echo "==> analyze + test"
@@ -13,8 +13,8 @@ dart test
 echo "==> dry-run"
 dart pub publish --dry-run
 
-echo "==> publish to pub.dev"
-dart pub publish --force
+echo "==> publish to pub.dev (pub asks for confirmation)"
+dart pub publish
 
 echo "==> push git + tag v${VERSION}"
 git push -u origin HEAD

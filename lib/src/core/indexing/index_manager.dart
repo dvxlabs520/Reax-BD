@@ -17,9 +17,14 @@ import '../query/query_builder.dart';
 import '../storage/storage_engine.dart';
 import 'secondary_index.dart';
 
-/// Decodes stored document bytes into a map, or returns null when the bytes
-/// are not a document (for example a raw binary value).
-typedef DocumentDecoder = Map<String, dynamic>? Function(Uint8List bytes);
+/// Decodes the stored bytes of the document under [key] into a map, or
+/// returns null when the bytes are not a document (for example a raw binary
+/// value).
+typedef DocumentDecoder =
+    Map<String, dynamic>? Function(Uint8List key, Uint8List bytes);
+
+/// Runs [action] while no other write of the database can run.
+typedef ExclusiveRunner = Future<T> Function<T>(Future<T> Function() action);
 
 /// Manages secondary indexes stored inside the primary [StorageEngine].
 ///
@@ -36,16 +41,23 @@ final class IndexManager {
   /// [decodeDocument] converts stored document bytes (as produced by the
   /// facade's serialization, after any decryption) back into a map; it is
   /// used for backfill during [createIndex].
+  ///
+  /// [exclusive] serializes index definition changes and backfill chunks
+  /// with the database's write pipeline; without it they run unguarded,
+  /// which is only safe when nothing else writes concurrently.
   IndexManager({
-    required StorageEngine storage,
-    required DocumentDecoder decodeDocument,
-  }) : _storage = storage,
-       _decodeDocument = decodeDocument;
+    required this._storage,
+    required this._decodeDocument,
+    ExclusiveRunner? exclusive,
+  }) : _exclusive = exclusive ?? _unguarded;
 
   static const int _backfillBatchSize = 500;
 
+  static Future<T> _unguarded<T>(Future<T> Function() action) => action();
+
   final StorageEngine _storage;
   final DocumentDecoder _decodeDocument;
+  final ExclusiveRunner _exclusive;
 
   /// Loaded definitions keyed by `collection NUL fieldSpec`.
   final Map<String, IndexDefinition> _indexes = {};
@@ -96,43 +108,61 @@ final class IndexManager {
     String collection,
     List<String> fields,
   ) async {
+    validateCollectionName(collection);
     final IndexDefinition definition = IndexDefinition(
       collection: collection,
       fields: fields,
     );
     final String mapKey = _key(collection, definition.fieldSpec);
-    if (_indexes.containsKey(mapKey)) {
-      throw QueryException('Index ${definition.name} already exists');
-    }
 
-    // Register before backfilling so concurrent pipeline writes maintain the
-    // index while the backfill scan runs; posting writes are idempotent.
-    _indexes[mapKey] = definition;
+    // Register under the pipeline lock so every write from now on maintains
+    // the index, and clear postings a crashed dropIndex may have left.
+    await _exclusive(() async {
+      if (_indexes.containsKey(mapKey)) {
+        throw QueryException('Index ${definition.name} already exists');
+      }
+      _indexes[mapKey] = definition;
+    });
     try {
+      await _deletePostings(definition);
       await _backfill(definition);
-      await _storage.put(
-        IndexKeyCodec.metaKey(definition),
-        utf8.encode(jsonEncode({'fields': fields})),
+      await _exclusive(
+        () => _storage.put(
+          IndexKeyCodec.metaKey(definition),
+          utf8.encode(jsonEncode({'fields': fields})),
+        ),
       );
     } catch (_) {
-      _indexes.remove(mapKey);
+      await _exclusive(() async => _indexes.remove(mapKey));
       rethrow;
     }
   }
 
   /// Drops the index over [fields] of [collection] and deletes all of its
   /// postings and metadata.
+  ///
+  /// The metadata key goes first, in the same step that stops maintenance:
+  /// a crash midway can leave orphaned postings (ignored, and cleared by a
+  /// later [createCompoundIndex]) but never an index that reloads with
+  /// postings missing.
   Future<void> dropIndex(String collection, List<String> fields) async {
     final IndexDefinition definition = IndexDefinition(
       collection: collection,
       fields: fields,
     );
     final String mapKey = _key(collection, definition.fieldSpec);
-    if (!_indexes.containsKey(mapKey)) {
-      throw QueryException('Index ${definition.name} does not exist');
-    }
-    _indexes.remove(mapKey);
+    await _exclusive(() async {
+      if (!_indexes.containsKey(mapKey)) {
+        throw QueryException('Index ${definition.name} does not exist');
+      }
+      await _storage.delete(IndexKeyCodec.metaKey(definition));
+      _indexes.remove(mapKey);
+    });
+    await _deletePostings(definition);
+  }
 
+  /// Deletes every posting of [definition], in chunks.
+  Future<void> _deletePostings(IndexDefinition definition) async {
     final Uint8List head = IndexKeyCodec.entryHead(definition);
     final Uint8List? end = IndexKeyCodec.prefixUpperBound(head);
     List<WriteOp> batch = [];
@@ -142,12 +172,14 @@ final class IndexManager {
     )) {
       batch.add(WriteOp.delete(pair.key));
       if (batch.length >= _backfillBatchSize) {
-        await _storage.writeBatch(batch);
+        final List<WriteOp> chunk = batch;
+        await _exclusive(() => _storage.writeBatch(chunk));
         batch = [];
       }
     }
-    batch.add(WriteOp.delete(IndexKeyCodec.metaKey(definition)));
-    await _storage.writeBatch(batch);
+    if (batch.isNotEmpty) {
+      await _exclusive(() => _storage.writeBatch(batch));
+    }
   }
 
   /// Whether an index exists whose first field is [field].
@@ -157,13 +189,11 @@ final class IndexManager {
   );
 
   /// All loaded index definitions, optionally restricted to [collection].
-  List<IndexDefinition> listIndexes([String? collection]) =>
-      _indexes.values
-          .where(
-            (IndexDefinition d) =>
-                collection == null || d.collection == collection,
-          )
-          .toList();
+  List<IndexDefinition> listIndexes([String? collection]) => _indexes.values
+      .where(
+        (IndexDefinition d) => collection == null || d.collection == collection,
+      )
+      .toList();
 
   /// Builds the index mutations for one document write.
   ///
@@ -225,6 +255,28 @@ final class IndexManager {
     String collection,
     List<QueryCondition> conditions,
   ) async {
+    final Stream<List<String>>? chunks = candidateIdChunks(
+      collection,
+      conditions,
+    );
+    if (chunks == null) return null;
+    final Set<String> ids = <String>{};
+    await for (final List<String> chunk in chunks) {
+      ids.addAll(chunk);
+    }
+    return ids;
+  }
+
+  /// [candidateIds] as a lazy stream of chunks of at most [chunkSize] ids,
+  /// in index order and without duplicates, so a caller that needs only the
+  /// first few matches stops the index scan early by cancelling. Chunked
+  /// because a stream event per id costs more than the lookup it feeds.
+  /// Null when no index can serve any of [conditions].
+  Stream<List<String>>? candidateIdChunks(
+    String collection,
+    List<QueryCondition> conditions, {
+    int chunkSize = 256,
+  }) {
     if (conditions.isEmpty) return null;
 
     _IndexPlan? best;
@@ -236,7 +288,7 @@ final class IndexManager {
       }
     }
     if (best == null) return null;
-    return _execute(best);
+    return _execute(best, chunkSize);
   }
 
   /// Releases in-memory index state.
@@ -246,36 +298,51 @@ final class IndexManager {
 
   // --- internals ---------------------------------------------------------
 
+  /// Builds postings for every existing document of the collection.
+  ///
+  /// The scan only discovers keys. Each chunk is then re-read and written
+  /// under the pipeline lock, so a document changed or deleted while the
+  /// backfill runs is indexed by its CURRENT version (or not at all), never
+  /// by the stale one the scan saw.
   Future<void> _backfill(IndexDefinition definition) async {
     final Uint8List start = utf8.encode('${definition.collection}:');
     final Uint8List? end = IndexKeyCodec.prefixUpperBound(start);
-    List<WriteOp> batch = [];
+    List<Uint8List> keys = [];
+
+    Future<void> indexChunk(List<Uint8List> chunk) => _exclusive(() async {
+      final List<WriteOp> batch = [];
+      for (final Uint8List key in chunk) {
+        final Uint8List? stored = await _storage.get(key);
+        if (stored == null) continue;
+        final Map<String, dynamic>? document = _decodeDocument(key, stored);
+        if (document == null) continue;
+        final String docId = utf8.decode(
+          Uint8List.sublistView(key, start.length),
+        );
+        batch.add(
+          WriteOp.put(
+            IndexKeyCodec.entryKey(definition, [
+              for (final String f in definition.fields)
+                extractFieldValue(document, f),
+            ], docId),
+            Uint8List(0),
+          ),
+        );
+      }
+      if (batch.isNotEmpty) await _storage.writeBatch(batch);
+    });
+
     await for (final KeyValue pair in _storage.scan(
       startKey: start,
       endKey: end,
     )) {
-      final Map<String, dynamic>? document = _decodeDocument(pair.value);
-      if (document == null) continue;
-      final String docId = utf8.decode(
-        Uint8List.sublistView(pair.key, start.length),
-      );
-      batch.add(
-        WriteOp.put(
-          IndexKeyCodec.entryKey(definition, [
-            for (final String f in definition.fields)
-              extractFieldValue(document, f),
-          ], docId),
-          Uint8List(0),
-        ),
-      );
-      if (batch.length >= _backfillBatchSize) {
-        await _storage.writeBatch(batch);
-        batch = [];
+      keys.add(pair.key);
+      if (keys.length >= _backfillBatchSize) {
+        await indexChunk(keys);
+        keys = [];
       }
     }
-    if (batch.isNotEmpty) {
-      await _storage.writeBatch(batch);
-    }
+    if (keys.isNotEmpty) await indexChunk(keys);
   }
 
   _IndexPlan? _plan(
@@ -288,8 +355,9 @@ final class IndexManager {
     _RangeBounds? range;
 
     for (final String field in definition.fields) {
-      final List<QueryCondition> onField =
-          conditions.where((QueryCondition c) => c.field == field).toList();
+      final List<QueryCondition> onField = conditions
+          .where((QueryCondition c) => c.field == field)
+          .toList();
       if (onField.isEmpty) break;
 
       QueryCondition? eq;
@@ -371,7 +439,7 @@ final class IndexManager {
     );
   }
 
-  Future<Set<String>> _execute(_IndexPlan plan) async {
+  Stream<List<String>> _execute(_IndexPlan plan, int chunkSize) async* {
     final IndexDefinition definition = plan.definition;
     final Uint8List head = IndexKeyCodec.entryHead(definition);
 
@@ -384,46 +452,56 @@ final class IndexManager {
       return out.toBytes();
     }
 
-    final Set<String> ids = <String>{};
+    final Set<String> seen = <String>{};
 
-    Future<void> scanRange(Uint8List startKey, Uint8List? endKey) async {
+    Stream<List<String>> scanRange(
+      Uint8List startKey,
+      Uint8List? endKey,
+    ) async* {
+      List<String> chunk = <String>[];
       await for (final KeyValue pair in _storage.scan(
         startKey: startKey,
         endKey: endKey,
       )) {
-        ids.add(IndexKeyCodec.docIdFromEntryKey(definition, pair.key));
+        final String id = IndexKeyCodec.docIdFromEntryKey(definition, pair.key);
+        if (!seen.add(id)) continue;
+        chunk.add(id);
+        if (chunk.length >= chunkSize) {
+          yield chunk;
+          chunk = <String>[];
+        }
       }
+      if (chunk.isNotEmpty) yield chunk;
     }
 
     // All postings whose leading components equal [values] exactly.
-    Future<void> scanEquality(List<dynamic> values) async {
+    Stream<List<String>> scanEquality(List<dynamic> values) {
       final Uint8List b = base(values);
       if (values.length == definition.fields.length) {
         // Next byte is the doc id tag 0x01.
-        await scanRange(
+        return scanRange(
           IndexKeyCodec.withSuffix(b, IndexValueCodec.docIdTag),
           IndexKeyCodec.withSuffix(b, IndexValueCodec.docIdTag + 1),
         );
-      } else {
-        // Next byte is a value tag; excludes 0xFF string continuations.
-        await scanRange(
-          IndexKeyCodec.withSuffix(b, IndexValueCodec.tagNull),
-          IndexKeyCodec.withSuffix(b, IndexValueCodec.valueTagUpperBound),
-        );
       }
+      // Next byte is a value tag; excludes 0xFF string continuations.
+      return scanRange(
+        IndexKeyCodec.withSuffix(b, IndexValueCodec.tagNull),
+        IndexKeyCodec.withSuffix(b, IndexValueCodec.valueTagUpperBound),
+      );
     }
 
     if (plan.inValues != null) {
       for (final dynamic value in plan.inValues!) {
-        await scanEquality([...plan.eqValues, value]);
+        yield* scanEquality([...plan.eqValues, value]);
       }
-      return ids;
+      return;
     }
 
     final _RangeBounds? range = plan.range;
     if (range == null) {
-      await scanEquality(plan.eqValues);
-      return ids;
+      yield* scanEquality(plan.eqValues);
+      return;
     }
 
     final Uint8List b = base(plan.eqValues);
@@ -432,29 +510,29 @@ final class IndexManager {
       startKey = b;
     } else {
       final Uint8List withValue = base([...plan.eqValues, range.lower]);
-      startKey =
-          range.lowerInclusive
-              ? withValue
-              : IndexKeyCodec.withSuffix(
-                withValue,
-                IndexValueCodec.boundarySentinel,
-              );
+      // An inexact bound (an integer beyond 2^53) shares its encoding with
+      // neighbours, so it is always scanned inclusively; the exact re-filter
+      // of loaded documents applies the real bound.
+      startKey = range.lowerInclusive || !isExactlyEncodable(range.lower)
+          ? withValue
+          : IndexKeyCodec.withSuffix(
+              withValue,
+              IndexValueCodec.boundarySentinel,
+            );
     }
     Uint8List? endKey;
     if (range.upper == _RangeBounds.unset) {
       endKey = IndexKeyCodec.withSuffix(b, IndexValueCodec.boundarySentinel);
     } else {
       final Uint8List withValue = base([...plan.eqValues, range.upper]);
-      endKey =
-          range.upperInclusive
-              ? IndexKeyCodec.withSuffix(
-                withValue,
-                IndexValueCodec.boundarySentinel,
-              )
-              : withValue;
+      endKey = range.upperInclusive || !isExactlyEncodable(range.upper)
+          ? IndexKeyCodec.withSuffix(
+              withValue,
+              IndexValueCodec.boundarySentinel,
+            )
+          : withValue;
     }
-    await scanRange(startKey, endKey);
-    return ids;
+    yield* scanRange(startKey, endKey);
   }
 }
 

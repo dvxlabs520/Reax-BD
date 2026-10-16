@@ -66,17 +66,15 @@ abstract final class ValueCodec {
       return _tagged(tagString, utf8.encode(value));
     }
     if (value is int) {
-      final ByteData data =
-          ByteData(9)
-            ..setUint8(0, tagInt)
-            ..setInt64(1, value, Endian.little);
+      final ByteData data = ByteData(9)
+        ..setUint8(0, tagInt)
+        ..setInt64(1, value, Endian.little);
       return data.buffer.asUint8List();
     }
     if (value is double) {
-      final ByteData data =
-          ByteData(9)
-            ..setUint8(0, tagDouble)
-            ..setFloat64(1, value, Endian.little);
+      final ByteData data = ByteData(9)
+        ..setUint8(0, tagDouble)
+        ..setFloat64(1, value, Endian.little);
       return data.buffer.asUint8List();
     }
     if (value is bool) {

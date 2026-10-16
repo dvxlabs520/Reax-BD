@@ -38,6 +38,14 @@ abstract interface class DocumentStore {
   /// Loads one document, or null when absent.
   Future<Map<String, dynamic>?> getDocument(String collection, String id);
 
+  /// Loads the documents of [ids] that exist, in the order given.
+  ///
+  /// Batched so an implementation can amortise per-lookup work.
+  Future<List<DocumentRecord>> getDocuments(
+    String collection,
+    List<String> ids,
+  );
+
   /// Writes [document] under [id] through the write pipeline.
   Future<void> putDocument(
     String collection,

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -42,6 +43,19 @@ abstract final class KeyDerivation {
     int iterations = defaultIterations,
     int length = keyLength,
   }) {
+    _validate(passphrase, salt, iterations, length);
+    final PBKDF2KeyDerivator derivator = PBKDF2KeyDerivator(
+      HMac(SHA256Digest(), 64),
+    )..init(Pbkdf2Parameters(salt, iterations, length));
+    return derivator.process(Uint8List.fromList(utf8.encode(passphrase)));
+  }
+
+  static void _validate(
+    String passphrase,
+    Uint8List salt,
+    int iterations,
+    int length,
+  ) {
     if (passphrase.isEmpty) {
       throw const EncryptionException('Passphrase must not be empty');
     }
@@ -59,11 +73,50 @@ abstract final class KeyDerivation {
     if (length <= 0) {
       throw EncryptionException('Invalid derived key length: $length');
     }
-    final PBKDF2KeyDerivator derivator = PBKDF2KeyDerivator(
-      HMac(SHA256Digest(), 64),
-    )..init(Pbkdf2Parameters(salt, iterations, length));
-    return derivator.process(Uint8List.fromList(utf8.encode(passphrase)));
   }
+
+  /// Like [deriveKey], but runs PBKDF2 on a short-lived background isolate
+  /// (`Isolate.run`) so the calling isolate — typically the UI isolate —
+  /// stays responsive.
+  ///
+  /// At [defaultIterations] the pure-Dart PBKDF2 takes on the order of a
+  /// second on a desktop and several seconds on a phone. Only the derivation
+  /// runs off-isolate: [passphrase] and [salt] are copied to the worker and
+  /// the derived key is copied back. Parameters are validated on the calling
+  /// isolate first, so invalid input throws [EncryptionException] without
+  /// spawning anything. The result is byte-for-byte identical to
+  /// [deriveKey].
+  static Future<Uint8List> deriveKeyInBackground({
+    required String passphrase,
+    required Uint8List salt,
+    int iterations = defaultIterations,
+    int length = keyLength,
+  }) {
+    _validate(passphrase, salt, iterations, length);
+    return _runDerivation(
+      passphrase,
+      Uint8List.fromList(salt),
+      iterations,
+      length,
+    );
+  }
+
+  // Kept separate so the closure handed to Isolate.run captures only the
+  // four sendable arguments and nothing else from the caller's scope.
+  static Future<Uint8List> _runDerivation(
+    String passphrase,
+    Uint8List salt,
+    int iterations,
+    int length,
+  ) => Isolate.run<Uint8List>(
+    () => deriveKey(
+      passphrase: passphrase,
+      salt: salt,
+      iterations: iterations,
+      length: length,
+    ),
+    debugName: 'reaxdb-pbkdf2',
+  );
 
   /// Generates a cryptographically secure random salt of [length] bytes
   /// using `Random.secure()`.

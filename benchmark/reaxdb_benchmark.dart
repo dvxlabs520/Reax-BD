@@ -245,11 +245,9 @@ Usage: dart run benchmark/reaxdb_benchmark.dart [options]
       for (final String name in scenarioNames)
         allScenarios.firstWhere(
           (Scenario s) => s.name == name,
-          orElse:
-              () =>
-                  throw FormatException(
-                    'unknown scenario "$name" (see --list-scenarios)',
-                  ),
+          orElse: () => throw FormatException(
+            'unknown scenario "$name" (see --list-scenarios)',
+          ),
         ),
     ];
   }
@@ -304,14 +302,13 @@ Usage: dart run benchmark/reaxdb_benchmark.dart [options]
             orElse: () => throw FormatException('unknown sync mode "$name"'),
           ),
       ],
-      scenarioNames:
-          flags['scenarios'] == null
-              ? const <String>[]
-              : flags['scenarios']!
-                  .split(',')
-                  .map((String s) => s.trim())
-                  .where((String s) => s.isNotEmpty)
-                  .toList(),
+      scenarioNames: flags['scenarios'] == null
+          ? const <String>[]
+          : flags['scenarios']!
+                .split(',')
+                .map((String s) => s.trim())
+                .where((String s) => s.isNotEmpty)
+                .toList(),
       runs: int.parse(flags['runs'] ?? '3'),
       warmupFraction: double.parse(flags['warmup'] ?? '0.1'),
       valueBytes: int.parse(flags['value-bytes'] ?? '200'),
@@ -321,10 +318,9 @@ Usage: dart run benchmark/reaxdb_benchmark.dart [options]
       jsonOutput: flags['json'],
       showHelp: switches.contains('help'),
       listScenarios: switches.contains('list-scenarios'),
-      crashWriter:
-          flags['crash-writer'] == null
-              ? null
-              : CrashWriterSpec.parse(flags['crash-writer']!),
+      crashWriter: flags['crash-writer'] == null
+          ? null
+          : CrashWriterSpec.parse(flags['crash-writer']!),
     );
   }
 
@@ -479,7 +475,7 @@ final class Environment {
     '  logical cpus     : $processors',
     '  asserts enabled  : $assertsEnabled'
         '${assertsEnabled ? "  (slower; pass no --enable-asserts for "
-                "production-like numbers)" : ""}',
+                  "production-like numbers)" : ""}',
     '  executable       : $executable',
     '  started          : ${timestamp.toIso8601String()}',
   ].join('\n');
@@ -607,11 +603,11 @@ final class ResultRow {
     required SyncMode syncMode,
     required List<Measurement> repetitions,
   }) {
-    final List<Measurement> ordered =
-        repetitions.toList()..sort(
-          (Measurement a, Measurement b) =>
-              a.itemsPerSecond.compareTo(b.itemsPerSecond),
-        );
+    final List<Measurement> ordered = repetitions.toList()
+      ..sort(
+        (Measurement a, Measurement b) =>
+            a.itemsPerSecond.compareTo(b.itemsPerSecond),
+      );
     final Measurement median = ordered[ordered.length ~/ 2];
     final double slowest = ordered.first.itemsPerSecond;
     final double fastest = ordered.last.itemsPerSecond;
@@ -812,10 +808,9 @@ final class BenchContext {
   /// hit ratio so the distinction stays visible in the output.
   Future<ReaxDB> open({int? memtableSizeBytes, String? subdirectory}) =>
       ReaxDB.open(
-        path:
-            subdirectory == null
-                ? directory
-                : '$directory${Platform.pathSeparator}$subdirectory',
+        path: subdirectory == null
+            ? directory
+            : '$directory${Platform.pathSeparator}$subdirectory',
         syncMode: syncMode,
         memtableSizeBytes: memtableSizeBytes ?? 4 * 1024 * 1024,
         cacheMaxEntries: size + 1024,
@@ -1064,13 +1059,12 @@ Future<Map<String, Measurement>> _rangeScan(BenchContext ctx) async {
       final int start = ctx.random.nextInt(max(1, ctx.size - window));
       final List<ReaxEntry<Map<String, dynamic>>> entries = await recorder
           .measure(
-            () =>
-                db
-                    .scan<Map<String, dynamic>>(
-                      startKey: documentKey(start),
-                      limit: window,
-                    )
-                    .toList(),
+            () => db
+                .scan<Map<String, dynamic>>(
+                  startKey: documentKey(start),
+                  limit: window,
+                )
+                .toList(),
           );
       total += entries.length;
     }
@@ -1181,13 +1175,18 @@ Future<Map<String, Measurement>> _reopenWalReplay(BenchContext ctx) async {
   // A child process writes and dies without closing, so the WAL holds every
   // record and the measured open() must replay all of them.
   final String dbPath = '${ctx.directory}${Platform.pathSeparator}replay';
-  final ProcessResult
-  result = await Process.run(Platform.resolvedExecutable, <String>[
-    'run',
-    ctx.selfPath,
-    '--crash-writer='
-        '${CrashWriterSpec(path: dbPath, count: ctx.size, syncMode: ctx.syncMode, valueBytes: ctx.options.valueBytes).encode()}',
-  ]);
+  final String crashWriter =
+      '--crash-writer='
+      '${CrashWriterSpec(path: dbPath, count: ctx.size, syncMode: ctx.syncMode, valueBytes: ctx.options.valueBytes).encode()}';
+  // Under `dart run` the executable is the Dart VM; compiled with
+  // `dart compile exe` it is the harness itself.
+  final bool compiled = !Platform.script.path.endsWith('.dart');
+  final ProcessResult result = await Process.run(
+    Platform.resolvedExecutable,
+    compiled
+        ? <String>[crashWriter]
+        : <String>['run', ctx.selfPath, crashWriter],
+  );
   if (result.exitCode != 0) {
     throw StateError(
       'crash writer failed (${result.exitCode}): ${result.stderr}',
