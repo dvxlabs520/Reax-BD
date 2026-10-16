@@ -6,6 +6,9 @@ has limits, the limits are stated.
 ## Contents
 
 - [Opening a database](#opening-a-database)
+- [Keys and values](#keys-and-values)
+- [Schema versions](#schema-versions)
+- [Durability contract](#durability-contract)
 - [Isolation levels](#isolation-levels)
 - [The write pipeline](#the-write-pipeline)
 - [Key space and the reserved 0x00 prefix](#key-space-and-the-reserved-0x00-prefix)
@@ -13,9 +16,12 @@ has limits, the limits are stated.
 - [Cache](#cache)
 - [Queries, indexes and the total order](#queries-indexes-and-the-total-order)
 - [Encryption](#encryption)
+- [TTL and expiry](#ttl-and-expiry)
+- [Change streams](#change-streams)
 - [Logging and redaction](#logging-and-redaction)
 - [Concurrency model](#concurrency-model)
 - [Operational notes](#operational-notes)
+- [Errors](#errors)
 
 ## Opening a database
 
@@ -66,6 +72,61 @@ at the end.
 `ReaxDB.closeAll()` closes every instance open in the current isolate. It
 exists for tests and for shutdown hooks.
 
+## Keys and values
+
+Keys are strings, encoded as UTF-8. They must be non-empty and must not start
+with byte `0x00`, which is reserved for ReaxDB's internal key space
+(secondary index postings and index metadata). A reserved key throws
+`InvalidKeyException`.
+
+Values may be `String`, `int`, `double`, `bool`, `null`, a byte list
+(`List<int>`), or anything `jsonEncode` accepts (maps and lists of the above).
+Anything else throws `SerializationException` at write time. ReaxDB never
+silently stores a mangled value or returns `null` to mean "decode failed".
+
+Documents use the key shape `collection:id`. That is what queries, indexes and
+typed collections address. Typed collections store ordinary documents under
+`<name>:<id>`, so they share indexes, queries and change streams with untyped
+access.
+
+## Schema versions
+
+The version passed as `schemaVersion` lives in the database header. Opening
+with a lower version than the stored one throws `SchemaVersionException`:
+there are no downgrades. Opening with a higher version and no `onUpgrade`
+callback also throws, rather than reading old data as if it were new.
+
+## Durability contract
+
+An awaited write that returns normally is recoverable, to the extent the
+effective sync mode promises:
+
+| `SyncMode` | Behaviour | Survives |
+| --- | --- | --- |
+| `none` | WAL records buffered in memory, written opportunistically | nothing guaranteed |
+| `os` | WAL records handed to the OS with `write()` before the call returns | process kill |
+| `full` (default) | WAL records fsynced with `RandomAccessFile.flush()` before the call returns | OS crash and power loss, within the limits below |
+
+Limits of `full`:
+
+- On macOS and iOS, `fsync` hands the data to the drive but does not force
+  the drive to empty its own write cache (that takes `F_FULLFSYNC`, which
+  ReaxDB does not issue, as SQLite does not by default). A power cut at the
+  wrong moment can still lose the last writes the drive had cached.
+- File creations, renames and deletions are made durable by fsyncing their
+  directory, through `dart:ffi` on Linux, Android, macOS and iOS. Windows
+  journals this metadata itself.
+
+```dart
+final db = await ReaxDB.open(path: '/data/app', syncMode: SyncMode.os);
+
+// One individual write that must survive power loss:
+await db.put('payment:1', receipt, sync: SyncMode.full);
+```
+
+A per-write `sync` override only ever strengthens durability; it cannot weaken
+the database default. See [Choosing a sync mode](#choosing-a-sync-mode).
+
 ## Isolation levels
 
 Four levels are implemented. Do not assume more than is listed.
@@ -82,6 +143,8 @@ add one and write it back can both commit, and the counter goes up by one:
 the read takes no lock, so neither sees the other. Measured: 20 concurrent
 increments under `readCommitted` end at 1, under `serializable` at 20. Use
 `serializable` (or `compareAndSwap`) for read-modify-write logic.
+`compareAndSwap` runs its read and write inside one serializable transaction,
+and compares maps and lists by content.
 
 ### `IsolationLevel.repeatableRead`
 
@@ -261,7 +324,20 @@ crash midway leaves only orphaned postings (cleared by the next
 
 ## Encryption
 
-See the envelope layout in the README. Additional details:
+Values are wrapped in a self-describing envelope:
+
+```text
+byte 0      envelope version (0x02; 0x01 envelopes written by 2.0.0 still read)
+byte 1      algorithm id (0x01 = XOR obfuscation, 0x02 = AES-256-GCM)
+AES-GCM:    bytes 2..13  random 96-bit IV from Random.secure()
+            bytes 14..   ciphertext || 16-byte authentication tag
+```
+
+`EncryptionConfig.obfuscation` exists and is honestly named: repeating-key XOR
+is **not** encryption, provides no confidentiality and no integrity, and must
+not be used for sensitive data.
+
+Details:
 
 - The GCM authentication tag is 128 bits and the IV is a fresh 96-bit value
   from `Random.secure()` per value.
@@ -288,6 +364,32 @@ See the envelope layout in the README. Additional details:
   field values) and the header are plaintext.
 
 `db.encryptionInfo` reports the **effective** algorithm, never a requested one.
+
+## TTL and expiry
+
+```dart
+await db.put('session:abc', token, ttl: const Duration(minutes: 30));
+await db.put('promo', banner, expiresAt: DateTime(2027, 1, 1));
+```
+
+An expired entry reads as absent: `get` returns null, `exists` returns false,
+and iteration skips it. It is reclaimed lazily the next time it is read. Call
+`db.purgeExpired()` to reclaim everything at once. The in-memory cache uses
+the same expiry instant.
+
+## Change streams
+
+`db.watch(pattern)` streams `DatabaseChangeEvent`s. `*` matches everything,
+`prefix*` matches by prefix, and anything else is an exact key. Events fire
+only after the durability point, so they never announce a write that is not
+on disk. `ReaxEntry.toString()` and `DatabaseChangeEvent.toString()` are
+redacted: they never print key or value content.
+
+A subscription that is paused or slower than the writes queues at most
+`changeStreamBufferSize` events (10,000 by default, set on `ReaxDB.open`).
+One more ends it with a `ChangeStreamOverflowException`, instead of using
+unbounded memory or dropping events silently. Re-read what you need and
+subscribe again.
 
 ## Logging and redaction
 
@@ -399,8 +501,9 @@ can read.
 
 `importFrom` verifies the digest over the whole file first, restores in
 batches into a temporary sibling directory, recreates the indexes and only
-then moves the result into place. Archives written by 2.0 (format version 1)
-are still restored.
+then moves the result into place. With `overwrite: true` it replaces only a
+ReaxDB database that no instance has open, never any other directory.
+Archives written by 2.0 (format version 1) are still restored.
 
 ### Disk full and other I/O failures
 
@@ -410,3 +513,27 @@ the database stays readable and later writes succeed once space is free. A
 failure in background maintenance after a write is already durable (flushing
 the memtable, compaction) does not fail that write; it is logged and retried
 on a later write.
+
+## Errors
+
+Every failure is a subtype of the sealed `ReaxDbException`, so one `on
+ReaxDbException` catches them all, and a `switch` over them is exhaustive:
+
+| Exception | When |
+| --- | --- |
+| `DatabaseClosedException` | the database or one of its parts is closed |
+| `DatabaseLockedException` | the database is already open somewhere else |
+| `InvalidKeyException` | an empty key, or one that starts with `0x00` |
+| `CorruptionException` | damaged files or archives |
+| `EncryptionException` | a wrong key or passphrase, or tampered data |
+| `TransactionConflictException` | a serializable or optimistic commit lost a race |
+| `DeadlockException` | the lock manager found a cycle |
+| `TransactionTimeoutException` | a lock wait exceeded `lockTimeout` |
+| `SchemaVersionException` | a downgrade, a missing `onUpgrade`, or a 1.x database |
+| `SerializationException` | a value that cannot be stored, or a read with the wrong type |
+| `QueryException` | an invalid query or index definition |
+| `UnsupportedApiException` | a 1.x API that 2.x cannot honour |
+| `StorageException` | a file system failure, such as a full disk |
+| `ChangeStreamOverflowException` | a change stream fell too far behind |
+
+Nothing is swallowed into a `null` or an empty result.
