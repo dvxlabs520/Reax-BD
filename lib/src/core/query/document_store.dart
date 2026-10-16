@@ -84,4 +84,15 @@ abstract interface class DocumentStore {
 
   /// Deletes the document under [id] through the write pipeline.
   Future<void> deleteDocument(String collection, String id);
+
+  /// Writes every document of [documents], keyed by id, in one atomic
+  /// batch through the write pipeline.
+  Future<void> putDocuments(
+    String collection,
+    Map<String, Map<String, dynamic>> documents,
+  );
+
+  /// Deletes the documents of [ids] in one atomic batch through the write
+  /// pipeline.
+  Future<void> deleteDocuments(String collection, List<String> ids);
 }

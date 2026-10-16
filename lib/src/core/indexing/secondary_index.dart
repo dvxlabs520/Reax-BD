@@ -487,6 +487,15 @@ bool isExactlyEncodable(dynamic value) {
 
 const int _maxExactInt = 9007199254740992; // 2^53
 
+/// A string that is equal for any two values [valuesEqual] considers equal,
+/// for grouping them in a hash map.
+///
+/// Different integers beyond 2^53 can share a bucket (their encodings
+/// round alike), so values in one bucket must still be compared with
+/// [valuesEqual].
+String totalOrderBucket(dynamic value) =>
+    String.fromCharCodes(IndexValueCodec.encodeValue(value));
+
 /// Returns true when [a] and [b] are equal under the index total order
 /// (structural equality for lists/maps, `5 == 5.0` for numbers).
 bool valuesEqual(dynamic a, dynamic b) => compareValues(a, b) == 0;

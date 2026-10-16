@@ -212,6 +212,23 @@ final class PipelineDocumentStore implements DocumentStore {
   }
 
   @override
+  Future<void> putDocuments(
+    String collection,
+    Map<String, Map<String, dynamic>> documents,
+  ) async {
+    for (final MapEntry<String, Map<String, dynamic>> e in documents.entries) {
+      await putDocument(collection, e.key, e.value);
+    }
+  }
+
+  @override
+  Future<void> deleteDocuments(String collection, List<String> ids) async {
+    for (final String id in ids) {
+      await deleteDocument(collection, id);
+    }
+  }
+
+  @override
   Stream<DocumentRecord> scanDocuments(String collection) async* {
     final Uint8List start = utf8.encode('$collection:');
     final Uint8List? end = IndexKeyCodec.prefixUpperBound(start);

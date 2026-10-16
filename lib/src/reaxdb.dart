@@ -284,6 +284,7 @@ final class ReaxDB {
     await _recoverInterruptedRestore(canonical);
     final Directory directory = Directory(path);
     await directory.create(recursive: true);
+    restrictToOwner(directory.path, directory: true);
 
     // The 1.x check runs before the lock is taken because an automatic
     // migration opens a 2.0 database at this very path through the public
@@ -2323,6 +2324,26 @@ final class _FacadeDocumentStore implements DocumentStore {
   @override
   Future<void> deleteDocument(String collection, String id) =>
       _db.delete('$collection:$id');
+
+  @override
+  Future<void> putDocuments(
+    String collection,
+    Map<String, Map<String, dynamic>> documents,
+  ) => documents.isEmpty
+      ? Future<void>.value()
+      : _db.putBatch(<String, Object?>{
+          for (final MapEntry<String, Map<String, dynamic>> e
+              in documents.entries)
+            '$collection:${e.key}': e.value,
+        });
+
+  @override
+  Future<void> deleteDocuments(String collection, List<String> ids) =>
+      ids.isEmpty
+      ? Future<void>.value()
+      : _db.deleteBatch(<String>[
+          for (final String id in ids) '$collection:$id',
+        ]);
 }
 
 /// The persisted database header.

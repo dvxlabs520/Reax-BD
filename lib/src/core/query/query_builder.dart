@@ -262,10 +262,16 @@ class QueryBuilder {
   /// value and equal lists/maps deduplicate structurally.
   Future<List<dynamic>> distinct(String field) async {
     final List<dynamic> values = [];
+    final Map<String, List<dynamic>> buckets = <String, List<dynamic>>{};
     for (final Map<String, dynamic> doc in await find()) {
       final dynamic value = extractFieldValue(doc, field);
       if (value == null) continue;
-      if (!values.any((dynamic v) => valuesEqual(v, value))) {
+      final List<dynamic> seen = buckets.putIfAbsent(
+        totalOrderBucket(value),
+        () => <dynamic>[],
+      );
+      if (!seen.any((dynamic v) => valuesEqual(v, value))) {
+        seen.add(value);
         values.add(value);
       }
     }
@@ -275,23 +281,27 @@ class QueryBuilder {
   /// Applies [updates] to every matching document and returns how many were
   /// written. Documents are addressed by the storage key they were loaded
   /// from, never by an id reconstructed from their fields.
+  ///
+  /// All the writes are one atomic batch: after a crash either every
+  /// matching document has the update or none has. Documents are matched
+  /// before the batch is written, so a write made in between can be
+  /// overwritten; use a transaction for read-modify-write logic.
   Future<int> update(Map<String, dynamic> updates) async {
     final List<DocumentRecord> records = await _findRecords();
-    for (final DocumentRecord record in records) {
-      await _store.putDocument(collection, record.id, {
-        ..._output(record.document),
-        ...updates,
-      });
-    }
+    await _store.putDocuments(collection, <String, Map<String, dynamic>>{
+      for (final DocumentRecord record in records)
+        record.id: <String, dynamic>{..._output(record.document), ...updates},
+    });
     return records.length;
   }
 
-  /// Deletes every matching document and returns how many were removed.
+  /// Deletes every matching document, in one atomic batch, and returns how
+  /// many were removed.
   Future<int> delete() async {
     final List<DocumentRecord> records = await _findRecords();
-    for (final DocumentRecord record in records) {
-      await _store.deleteDocument(collection, record.id);
-    }
+    await _store.deleteDocuments(collection, <String>[
+      for (final DocumentRecord record in records) record.id,
+    ]);
     return records.length;
   }
 

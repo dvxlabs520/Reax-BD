@@ -159,11 +159,18 @@ final class AggregationBuilder {
   List<GroupByResult> _executeGrouped(List<Map<String, dynamic>> documents) {
     final List<dynamic> groupKeys = [];
     final List<List<Map<String, dynamic>>> groupDocs = [];
+    // Groups by bucket, so finding a document's group is O(1) instead of a
+    // pass over every group.
+    final Map<String, List<int>> buckets = <String, List<int>>{};
 
     for (final Map<String, dynamic> doc in documents) {
       final dynamic groupKey = extractFieldValue(doc, _groupByField!);
+      final List<int> candidates = buckets.putIfAbsent(
+        totalOrderBucket(groupKey),
+        () => <int>[],
+      );
       int index = -1;
-      for (int i = 0; i < groupKeys.length; i++) {
+      for (final int i in candidates) {
         if (valuesEqual(groupKeys[i], groupKey)) {
           index = i;
           break;
@@ -173,6 +180,7 @@ final class AggregationBuilder {
         groupKeys.add(groupKey);
         groupDocs.add([]);
         index = groupKeys.length - 1;
+        candidates.add(index);
       }
       groupDocs[index].add(doc);
     }
