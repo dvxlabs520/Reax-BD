@@ -735,10 +735,13 @@ final class ReaxDB {
       _path,
       _storage.scan(startKey: _userKeySpaceStart),
     )) {
-      final StoredRecord record = RecordEnvelope.decode(
-        _toEnvelope(pair.value, pair.key),
+      // Decrypted now, which also proves the key; decoded on first read.
+      final Uint8List envelope = _toEnvelope(pair.value, pair.key);
+      memory.putEncoded(
+        utf8.decode(pair.key),
+        envelope,
+        RecordEnvelope.peekExpiry(envelope),
       );
-      memory.put(utf8.decode(pair.key), record.value, record.expiresAt);
     }
   }
 
@@ -1211,11 +1214,12 @@ final class ReaxDB {
           if (mutation.isDelete) {
             memory.remove(mutation.key);
           } else {
-            // Decoded from the envelope, so memory holds exactly what a read
-            // from disk would return, and never the caller's own object.
-            memory.put(
+            // The envelope, decoded on first read: memory then holds exactly
+            // what a read from disk would return, and never the caller's own
+            // object.
+            memory.putEncoded(
               mutation.key,
-              RecordEnvelope.decode(mutation.envelope!).value,
+              mutation.envelope!,
               mutation.expiresAt,
             );
           }
@@ -1443,8 +1447,9 @@ final class ReaxDB {
       final StoredRecord record = RecordEnvelope.decode(envelope);
       final MemoryStore? memory = _memory;
       if (memory != null) {
-        // A copy: the decoded value also goes to change-event listeners.
-        memory.put(op.key, copyValue(record.value), record.expiresAt);
+        // The envelope, not the decoded value, which also goes to
+        // change-event listeners.
+        memory.putEncoded(op.key, envelope, record.expiresAt);
       } else {
         _cache.put(op.key, envelope, expiresAt: record.expiresAt);
       }

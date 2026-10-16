@@ -6,14 +6,34 @@ import 'dart:math' show min;
 import 'dart:typed_data';
 
 import '../util/code_point_order.dart';
+import '../util/value_codec.dart';
 
-/// One decoded entry: the user value and its optional expiry.
+/// One entry: the user value and its optional expiry.
+///
+/// An entry made from a record envelope decodes it the first time its value
+/// is read, then keeps the decoded value. Writes and opening therefore pay
+/// no decoding; each value is decoded once, when it is first needed.
 final class MemoryEntry {
-  /// Creates an entry.
-  const MemoryEntry(this.value, this.expiresAt);
+  /// Creates an entry holding a decoded [value].
+  MemoryEntry(Object? value, this.expiresAt) : _value = value;
+
+  /// Creates an entry from a plaintext record [envelope], decoded on first
+  /// use.
+  MemoryEntry.encoded(Uint8List envelope, this.expiresAt)
+    : _envelope = envelope;
+
+  Object? _value;
+  Uint8List? _envelope;
 
   /// The decoded value, exactly as a read from disk would return it.
-  final Object? value;
+  Object? get value {
+    final Uint8List? envelope = _envelope;
+    if (envelope != null) {
+      _value = RecordEnvelope.decode(envelope).value;
+      _envelope = null;
+    }
+    return _value;
+  }
 
   /// Absolute expiry instant, or null when the entry never expires.
   final DateTime? expiresAt;
@@ -46,9 +66,17 @@ final class MemoryStore {
   MemoryEntry? operator [](String key) => _entries[key];
 
   /// Stores [value] under [key].
-  void put(String key, Object? value, DateTime? expiresAt) {
+  void put(String key, Object? value, DateTime? expiresAt) =>
+      _store(key, MemoryEntry(value, expiresAt));
+
+  /// Stores the plaintext record [envelope] under [key], decoded on first
+  /// read.
+  void putEncoded(String key, Uint8List envelope, DateTime? expiresAt) =>
+      _store(key, MemoryEntry.encoded(envelope, expiresAt));
+
+  void _store(String key, MemoryEntry entry) {
     if (_entries[key] == null) _ordered.add(key);
-    _entries[key] = MemoryEntry(value, expiresAt);
+    _entries[key] = entry;
   }
 
   /// Removes [key].
