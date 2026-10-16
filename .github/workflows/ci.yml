@@ -20,6 +20,10 @@ jobs:
             flutter: '3.47.7'
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The 1.x migration tests rebuild fixtures from the 1.4.1 sources
+          # in git history.
+          fetch-depth: 0
 
       - uses: subosito/flutter-action@v2
         with:

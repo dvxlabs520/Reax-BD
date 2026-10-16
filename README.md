@@ -369,9 +369,11 @@ A second `ReaxDB.open` of a database that is already open throws
 `DatabaseLockedException`. That holds for another process, for another isolate
 of the same process (for example a background isolate started by a Flutter
 plugin), and for the same directory reached through a symlink or a
-differently cased path. The guard is a `flock` on `<path>/LOCK`, taken
-through `dart:ffi` on Linux, Android, macOS and iOS; on Windows it is the
-`dart:io` file lock, which also excludes other isolates there.
+differently cased path. Two locks guard it: a `flock` on `<path>/LOCK.flock`,
+taken through `dart:ffi` on Linux, Android, macOS and iOS, excludes other
+isolates and other paths to the same directory; the `dart:io` file lock on
+`<path>/LOCK` excludes other processes, including ones still on ReaxDB 2.0.
+On Windows the `dart:io` lock excludes other isolates as well.
 
 The operating system releases the lock when a process dies, so a crash never
 leaves a stale lock: the file remains on disk but is unlocked, and the next

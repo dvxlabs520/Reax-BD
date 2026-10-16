@@ -101,6 +101,20 @@ final class _HandlePool {
   int _opened = 0;
   bool _closed = false;
 
+  /// Handle closes started but not finished; [close] waits for them, so a
+  /// closed table holds no open descriptor (Windows cannot delete a file
+  /// that is still open).
+  final Set<Future<void>> _closing = <Future<void>>{};
+
+  void _closeLater(RandomAccessFile raf) {
+    late final Future<void> done;
+    done = raf
+        .close()
+        .then<void>((_) {}, onError: (Object _) {})
+        .whenComplete(() => _closing.remove(done));
+    _closing.add(done);
+  }
+
   /// Handles currently open (idle or in use).
   int get openHandles => _opened;
 
@@ -132,7 +146,7 @@ final class _HandlePool {
       _waiters.removeFirst().complete(raf);
     } else if (_closed) {
       _opened--;
-      unawaited(raf.close().catchError((Object _) => raf));
+      _closeLater(raf);
     } else {
       final h = _IdleHandle(this, raf);
       _free.add(h);
@@ -144,7 +158,7 @@ final class _HandlePool {
   void _evict(_IdleHandle h) {
     if (!_free.remove(h)) return;
     _opened--;
-    unawaited(h.raf.close().catchError((Object _) => h.raf));
+    _closeLater(h.raf);
   }
 
   Future<void> close() async {
@@ -165,6 +179,7 @@ final class _HandlePool {
         // The descriptor is gone either way.
       }
     }
+    await Future.wait(List.of(_closing));
   }
 }
 

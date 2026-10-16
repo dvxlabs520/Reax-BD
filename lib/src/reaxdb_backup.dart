@@ -301,6 +301,45 @@ Future<void> _verifyArchiveDigest(File file, int length) async {
   }
 }
 
+/// Retries [action] while Windows reports a sharing violation.
+///
+/// Windows refuses to rename or delete a file that any process still has
+/// open, and antivirus scanners and the search indexer open freshly written
+/// files for a moment. Elsewhere [action] runs once.
+Future<void> _retryWhileBusy(Future<void> Function() action) async {
+  for (int attempt = 1; ; attempt++) {
+    try {
+      await action();
+      return;
+    } on FileSystemException {
+      if (!Platform.isWindows || attempt >= 20) rethrow;
+      await Future<void>.delayed(Duration(milliseconds: 25 * attempt));
+    }
+  }
+}
+
+/// Throws unless [path] may receive a restored database: it must be absent
+/// or empty, or, with [overwrite], hold a ReaxDB database.
+Future<void> _checkRestoreTarget(String path, bool overwrite) async {
+  final Directory target = Directory(path);
+  if (!await target.exists() || await target.list().isEmpty) return;
+  if (!overwrite) {
+    throw DatabaseLockedException(
+      'Target directory "$path" is not empty. Pass overwrite: true to '
+      'replace the ReaxDB database in it.',
+      path: path,
+    );
+  }
+  if (!await File(p.join(path, ReaxDB.headerFileName)).exists()) {
+    throw DatabaseLockedException(
+      'Target directory "$path" is not empty and is not a ReaxDB database. '
+      'importFrom only replaces ReaxDB databases; choose an empty or new '
+      'directory.',
+      path: path,
+    );
+  }
+}
+
 /// Moves a restored database from [staging] to [path], replacing what is
 /// there only when [overwrite] allows it and the target is a ReaxDB
 /// database (or empty), under that database's own lock.
@@ -309,45 +348,30 @@ Future<void> _installRestoredDatabase(
   String path,
   bool overwrite,
 ) async {
+  // Checked again: the target may have changed while the archive restored.
+  await _checkRestoreTarget(path, overwrite);
   final Directory target = Directory(path);
+  if (await target.exists() && await target.list().isEmpty) {
+    await _retryWhileBusy(target.delete);
+  }
   if (!await target.exists()) {
-    await staging.rename(path);
+    await _retryWhileBusy(() => staging.rename(path));
     syncDirectory(p.dirname(p.absolute(path)));
     return;
   }
-  final bool empty = await target.list().isEmpty;
-  if (!empty) {
-    if (!overwrite) {
-      throw DatabaseLockedException(
-        'Target directory "$path" is not empty. Pass overwrite: true to '
-        'replace the ReaxDB database in it.',
-        path: path,
-      );
-    }
-    if (!await File(p.join(path, ReaxDB.headerFileName)).exists()) {
-      throw DatabaseLockedException(
-        'Target directory "$path" is not empty and is not a ReaxDB database. '
-        'importFrom only replaces ReaxDB databases; choose an empty or new '
-        'directory.',
-        path: path,
-      );
-    }
-  }
-  // Hold the existing database's lock while swapping it out, so an
-  // instance open elsewhere is never replaced underneath.
+  // Taking the existing database's lock proves no instance has it open, so
+  // it is never replaced underneath one. The lock is released before the
+  // rename because Windows cannot rename a directory holding an open file.
   final _DatabaseLock lock = await _DatabaseLock.acquire(
     ReaxDB._canonicalize(path),
   );
+  await lock.release();
   final String replaced =
       '$path.replaced-${DateTime.now().microsecondsSinceEpoch}';
-  try {
-    await target.rename(replaced);
-  } finally {
-    await lock.release();
-  }
-  await staging.rename(path);
+  await _retryWhileBusy(() => target.rename(replaced));
+  await _retryWhileBusy(() => staging.rename(path));
   syncDirectory(p.dirname(p.absolute(path)));
-  await Directory(replaced).delete(recursive: true);
+  await _retryWhileBusy(() => Directory(replaced).delete(recursive: true));
 }
 
 Future<ReaxDB> _importArchive({
@@ -397,8 +421,10 @@ Future<ReaxDB> _importArchive({
       offset: 4,
     );
   }
-  // Nothing is written before the whole file checks out.
+  // Nothing is written before the whole file checks out, or before the
+  // target is known to be usable.
   await _verifyArchiveDigest(file, length);
+  await _checkRestoreTarget(path, overwrite);
 
   // Restore into a sibling staging directory and move it into place only
   // once complete: a failure or a crash midway never leaves a half-restored
@@ -546,7 +572,9 @@ Future<ReaxDB> _importArchive({
     await _installRestoredDatabase(staging, path, overwrite);
   } catch (_) {
     await db?.close();
-    if (await staging.exists()) await staging.delete(recursive: true);
+    if (await staging.exists()) {
+      await _retryWhileBusy(() => staging.delete(recursive: true));
+    }
     rethrow;
   } finally {
     await handle.close();

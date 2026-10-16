@@ -52,9 +52,10 @@ regression test that fails on 2.0.0. The on-disk format stays compatible:
 - PBKDF2 key derivation (210,000 iterations) ran on the calling isolate and
   froze a Flutter UI for seconds. It now runs in `Isolate.run`.
 - Two isolates of one process, or a symlinked or differently cased path,
-  could open the same database at once and lose writes. The lock is now a
-  `flock(2)` taken through `dart:ffi`, which excludes all of them; Windows
-  keeps the `dart:io` lock, which already did.
+  could open the same database at once and lose writes. A `flock(2)` on
+  `LOCK.flock`, taken through `dart:ffi`, now excludes them; the `dart:io`
+  lock on `LOCK` still excludes other processes, including 2.0.0 ones.
+  Windows keeps the `dart:io` lock, which already excluded isolates.
 - `Redaction.key` was a plain truncated SHA-256, reversible for guessable keys
   such as emails. It is now an HMAC under a random per-isolate key.
 - Migration warnings contained raw 1.x keys, and were logged.

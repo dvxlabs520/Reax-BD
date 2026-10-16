@@ -6,6 +6,8 @@ import 'package:reaxdb_dart/src/core/errors/exceptions.dart';
 import 'package:reaxdb_dart/src/core/wal/write_ahead_log.dart';
 import 'package:test/test.dart';
 
+import '../support/temp_dir.dart';
+
 Uint8List _b(String s) => Uint8List.fromList(utf8.encode(s));
 
 Future<List<File>> _walFiles(Directory dir) async {
@@ -25,7 +27,7 @@ void main() {
   });
 
   tearDown(() async {
-    if (await dir.exists()) await dir.delete(recursive: true);
+    await deleteTempDirectory(dir);
   });
 
   group('WAL fault injection', () {

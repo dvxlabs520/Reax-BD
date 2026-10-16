@@ -1782,101 +1782,109 @@ final class _Mutation {
 
 /// The exclusive lock on a database directory.
 ///
-/// On Linux, Android, macOS and iOS it is a `flock(2)` on `<path>/LOCK`,
-/// taken through [NativeIo]. A `flock` belongs to one open file description,
-/// so it excludes another process, another isolate of this process, and a
-/// second open of the same directory through a different spelling of its
-/// path (a symlink, or different letter case on a case-insensitive file
-/// system). The operating system drops it when the process dies, and a
-/// native finalizer closes it if the isolate that holds it goes away
-/// without closing the database, so a crash never leaves a stale lock.
+/// Two locks are taken, on two files:
 ///
-/// Elsewhere (Windows, or a file system without `flock`) it falls back to
-/// the `dart:io` advisory lock, which on POSIX only excludes other
-/// processes.
+/// - On Linux, Android, macOS and iOS, a `flock(2)` on `<path>/LOCK.flock`,
+///   taken through [NativeIo]. A `flock` belongs to one open file
+///   description, so it excludes another isolate of this process and a
+///   second open of the same directory through a different spelling of its
+///   path (a symlink, or different letter case on a case-insensitive file
+///   system). A native finalizer closes it if the isolate that holds it goes
+///   away without closing the database.
+/// - Everywhere, the `dart:io` advisory lock on `<path>/LOCK`, as in 2.0. It
+///   excludes other processes, including ones running ReaxDB 2.0.0. (On
+///   Windows it is a `LockFileEx` lock, which also excludes other isolates.)
+///
+/// They use separate files because POSIX releases ALL of a process's
+/// `fcntl` locks on a file when ANY descriptor of that file is closed, and
+/// because `flock` and `fcntl` locks on one file interact on some systems.
+/// Only the holder of the `flock` ever opens `LOCK`. The operating system
+/// drops both when the process dies, so a crash never leaves a stale lock.
 final class _DatabaseLock implements Finalizable {
-  _DatabaseLock._native(this._fd) : _handle = null;
+  _DatabaseLock._(this._fd, this._handle);
 
-  _DatabaseLock._io(this._handle) : _fd = null;
+  /// Name of the `flock` file next to [ReaxDB.lockFileName].
+  static const String isolateLockFileName = 'LOCK.flock';
 
   final int? _fd;
-  final RandomAccessFile? _handle;
+  final RandomAccessFile _handle;
   bool _released = false;
 
   static Future<_DatabaseLock> acquire(String canonical) async {
-    final File file = File(p.join(canonical, ReaxDB.lockFileName));
-    if (!await file.exists()) await file.create();
-    final String owner = '$pid\n${DateTime.now().toIso8601String()}\n';
-
+    int? fd;
     final NativeIo? io = NativeIo.instance;
     if (io != null) {
-      final int fd = io.tryLockExclusive(file.path);
-      if (fd >= 0) {
-        final _DatabaseLock lock = _DatabaseLock._native(fd);
-        io.closeFinalizer.attach(
-          lock,
-          Pointer<Void>.fromAddress(fd),
-          detach: lock,
-        );
-        try {
-          await file.writeAsString(owner, flush: true);
-        } catch (_) {
-          // The lock itself is what matters; the contents are informational.
-        }
-        return lock;
-      }
-      if (fd == NativeIo.lockBusy) {
+      final File isolateLock = File(p.join(canonical, isolateLockFileName));
+      if (!await isolateLock.exists()) await isolateLock.create();
+      final int result = io.tryLockExclusive(isolateLock.path);
+      if (result == NativeIo.lockBusy) {
         throw DatabaseLockedException(
-          'Database at "$canonical" is already open: by another process, by '
-          'another isolate of this process, or by another ReaxDB instance '
-          'that opened the same directory through a different path. Close '
-          'that instance first; only one may write a database at a time.',
+          'Database at "$canonical" is already open: by another isolate of '
+          'this process, or by another ReaxDB instance that opened the same '
+          'directory through a different path. Close that instance first; '
+          'only one may write a database at a time.',
           path: canonical,
         );
       }
-      // flock is not supported on this file system: fall back below.
+      // lockUnsupported: this file system has no flock; the process-level
+      // lock below still applies.
+      if (result >= 0) fd = result;
     }
 
-    final RandomAccessFile handle = await file.open(mode: FileMode.append);
+    final File file = File(p.join(canonical, ReaxDB.lockFileName));
+    final RandomAccessFile handle;
     try {
-      await handle.lock(FileLock.exclusive);
-    } on FileSystemException catch (error) {
-      await handle.close();
-      throw DatabaseLockedException(
-        'Database at "$canonical" is locked by another process',
-        path: canonical,
-        cause: error,
-      );
+      handle = await file.open(mode: FileMode.append);
+      try {
+        await handle.lock(FileLock.exclusive);
+      } on FileSystemException catch (error) {
+        await handle.close();
+        throw DatabaseLockedException(
+          'Database at "$canonical" is locked by another process',
+          path: canonical,
+          cause: error,
+        );
+      }
+    } catch (_) {
+      if (fd != null) io!.unlock(fd);
+      rethrow;
     }
     try {
       await handle.truncate(0);
-      await handle.writeString(owner);
+      await handle.setPosition(0);
+      await handle.writeString('$pid\n${DateTime.now().toIso8601String()}\n');
     } catch (_) {
       // The lock itself is what matters; the contents are informational.
     }
-    return _DatabaseLock._io(handle);
+    final _DatabaseLock lock = _DatabaseLock._(fd, handle);
+    if (fd != null) {
+      io!.closeFinalizer.attach(
+        lock,
+        Pointer<Void>.fromAddress(fd),
+        detach: lock,
+      );
+    }
+    return lock;
   }
 
   Future<void> release() async {
     if (_released) return;
     _released = true;
+    try {
+      await _handle.unlock();
+    } catch (_) {
+      // Already released, for example because the file was removed.
+    }
+    try {
+      await _handle.close();
+    } catch (_) {
+      // Nothing further to do while closing.
+    }
     final int? fd = _fd;
     if (fd != null) {
       final NativeIo io = NativeIo.instance!;
       io.closeFinalizer.detach(this);
       io.unlock(fd);
-      return;
-    }
-    final RandomAccessFile handle = _handle!;
-    try {
-      await handle.unlock();
-    } catch (_) {
-      // Already released, for example because the file was removed.
-    }
-    try {
-      await handle.close();
-    } catch (_) {
-      // Nothing further to do while closing.
     }
   }
 }

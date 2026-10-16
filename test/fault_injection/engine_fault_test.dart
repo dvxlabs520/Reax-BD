@@ -10,6 +10,8 @@ import 'package:reaxdb_dart/src/core/util/byte_key.dart';
 import 'package:reaxdb_dart/src/core/wal/write_ahead_log.dart';
 import 'package:test/test.dart';
 
+import '../support/temp_dir.dart';
+
 Uint8List _b(String s) => Uint8List.fromList(utf8.encode(s));
 
 void main() {
@@ -20,7 +22,7 @@ void main() {
   });
 
   tearDown(() async {
-    if (await dir.exists()) await dir.delete(recursive: true);
+    await deleteTempDirectory(dir);
   });
 
   Directory tablesDir() => Directory(p.join(dir.path, 'tables'));

@@ -200,15 +200,16 @@ void main() {
       await File(script).writeAsString('''
 import 'dart:io';
 Future<void> main() async {
-  final RandomAccessFile handle =
-      await File('${at('cross')}/LOCK').open(mode: FileMode.write);
+  RandomAccessFile? handle;
   try {
+    // On Windows a locked file may already refuse to open.
+    handle = await File('${at('cross')}/LOCK').open(mode: FileMode.append);
     await handle.lock(FileLock.exclusive);
     stdout.write('acquired');
   } on FileSystemException {
     stdout.write('locked');
   }
-  await handle.close();
+  await handle?.close();
 }
 ''');
       final ProcessResult result = await Process.run(

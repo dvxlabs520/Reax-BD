@@ -352,9 +352,13 @@ A database is used from one isolate at a time. Within that isolate:
 Concurrent `await`ed calls from the same isolate are safe. A second open of
 an open database fails with `DatabaseLockedException`, whether it comes from
 another process, another isolate of this process, or a symlinked or
-differently cased path in this isolate: the lock is a `flock` on
-`<path>/LOCK` (through `dart:ffi`), which belongs to one open file, not to
-the whole process. On Windows the `dart:io` lock gives the same guarantee. If
+differently cased path in this isolate. A `flock` on `<path>/LOCK.flock`
+(through `dart:ffi`) belongs to one open file, not to the whole process, so
+it excludes other isolates and aliases; the `dart:io` advisory lock on
+`<path>/LOCK` excludes other processes, including ReaxDB 2.0. They are on
+separate files because closing any descriptor of a file drops all of the
+process's `fcntl` locks on it. On Windows the `dart:io` lock alone gives the
+same guarantee. If
 an isolate that holds a database dies without closing it, the lock is
 released when that isolate's memory is reclaimed; close databases
 explicitly.

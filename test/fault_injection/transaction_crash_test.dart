@@ -8,6 +8,8 @@ import 'package:reaxdb_dart/src/core/transactions/transaction_manager.dart';
 import 'package:reaxdb_dart/src/core/wal/write_ahead_log.dart';
 import 'package:test/test.dart';
 
+import '../support/temp_dir.dart';
+
 Uint8List bytes(String s) => Uint8List.fromList(utf8.encode(s));
 
 /// Engine that "crashes" (throws) inside writeBatch, applying nothing, and
@@ -92,9 +94,7 @@ void main() {
     });
 
     tearDown(() async {
-      if (await dir.exists()) {
-        await dir.delete(recursive: true);
-      }
+      await deleteTempDirectory(dir);
     });
 
     test('a transaction whose commit record never hit disk is discarded '
