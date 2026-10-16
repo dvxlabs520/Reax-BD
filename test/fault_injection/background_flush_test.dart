@@ -140,8 +140,11 @@ void main() {
   });
 
   test('forEachOldestFirst rebuilds exactly what a scan returns', () async {
+    // No fsync: 6,000 durable writes take more than the timeout on Windows,
+    // and this test is about what is read back, not durability.
     final e = await LsmStorageEngine.open(
       directory: dir.path,
+      syncMode: SyncMode.none,
       memtableSizeBytes: 8 * 1024,
       l0CompactionTrigger: 2,
       baseLevelTargetBytes: 32 * 1024,
