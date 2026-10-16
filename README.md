@@ -207,6 +207,14 @@ final db = await ReaxDB.open(
 Values are encrypted. Keys and indexed fields are not, so do not put secrets
 in keys and do not index a secret field. A wrong key fails at `open`.
 
+To change the key (2.5.0), call `rekey`. It returns the database opened with
+the new key:
+
+```dart
+db = await db.rekey(EncryptionConfig.aes256(key: newKey32Bytes));
+// or: db = await db.changePassphrase('new secret');
+```
+
 ### Entries that expire
 
 ```dart

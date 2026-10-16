@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' show Finalizable, Pointer, Void;
 import 'dart:io';
+import 'dart:math' show Random;
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
@@ -117,6 +118,7 @@ final class ReaxDB {
     required this._lockFile,
     required this._header,
     required this._memory,
+    required this._reopen,
   });
 
   /// Instances open in this isolate, keyed by canonical directory path.
@@ -141,6 +143,9 @@ final class ReaxDB {
 
   /// Every user entry, decoded, when opened with `keepInMemory: true`.
   final MemoryStore? _memory;
+
+  /// Opens this database again with the same options and [encryption].
+  final Future<ReaxDB> Function(EncryptionConfig encryption) _reopen;
 
   _DatabaseHeader _header;
   bool _closed = false;
@@ -276,6 +281,7 @@ final class ReaxDB {
     // Finish (or discard) a 1.x migration a crash interrupted, before the
     // directory is created: an interrupted swap can leave the path missing.
     await LegacyMigration.recoverInterrupted(canonical);
+    await _recoverInterruptedRestore(canonical);
     final Directory directory = Directory(path);
     await directory.create(recursive: true);
 
@@ -386,6 +392,24 @@ final class ReaxDB {
         lockFile: lockFile,
         header: header,
         memory: keepInMemory ? MemoryStore() : null,
+        reopen: (EncryptionConfig newEncryption) => ReaxDB.open(
+          path: path,
+          encryption: newEncryption,
+          syncMode: syncMode,
+          memtableSizeBytes: memtableSizeBytes,
+          cacheMaxEntries: cacheMaxEntries,
+          cacheMaxMemoryBytes: cacheMaxMemoryBytes,
+          cacheDefaultTtl: cacheDefaultTtl,
+          changeStreamBufferSize: changeStreamBufferSize,
+          keepInMemory: keepInMemory,
+          logLevel: logLevel,
+          logOutputs: logOutputs,
+          loggerName: loggerName,
+          defaultIsolationLevel: defaultIsolationLevel,
+          lockTimeout: lockTimeout,
+          schemaVersion: schemaVersion,
+          onUpgrade: onUpgrade,
+        ),
       );
 
       pipeline.attach(db);
@@ -1775,6 +1799,76 @@ final class ReaxDB {
       ),
     );
   }
+
+  /// Re-encrypts every value with [newEncryption] and returns the database
+  /// opened with it. This instance is closed.
+  ///
+  /// Use it to rotate a key, to start encrypting a database, or to remove
+  /// encryption (`EncryptionConfig.none()`). Every value is written again,
+  /// so values written by 2.0.0 are also bound to their key afterwards.
+  ///
+  /// The data is exported to an archive next to the database, encrypted
+  /// with a random key that exists only in memory, and restored into a
+  /// temporary directory that replaces the database only when complete. No
+  /// plaintext is written to disk, and a crash at any point leaves the
+  /// database readable with either the old configuration or the new one,
+  /// never a mix. It needs free space for about two copies of the data.
+  ///
+  /// New calls on this instance fail with [DatabaseClosedException] once
+  /// this starts; calls already running finish first. On failure the
+  /// database keeps its old encryption and this instance stays closed: open
+  /// it again.
+  Future<ReaxDB> rekey(EncryptionConfig newEncryption) async {
+    _ensureOpen();
+    _closing = true;
+    final Random random = Random.secure();
+    final EncryptionConfig transport = EncryptionConfig.aes256(
+      key: Uint8List.fromList(
+        List<int>.generate(32, (int _) => random.nextInt(256)),
+      ),
+    );
+    final String archive =
+        '$_path.rekey-${DateTime.now().microsecondsSinceEpoch}.rxdb';
+    try {
+      while (_inFlight.isNotEmpty) {
+        await Future.wait<void>(_inFlight.toList());
+      }
+      await _guardIo(
+        archive,
+        () => _ioMutex.run(() => _exportArchive(this, archive, transport)),
+      );
+      await close();
+      final ReaxDB restored = await importFrom(
+        archivePath: archive,
+        path: _path,
+        encryption: newEncryption,
+        archiveEncryption: transport,
+        syncMode: _syncMode,
+        overwrite: true,
+      );
+      await restored.close();
+    } catch (_) {
+      await close();
+      rethrow;
+    } finally {
+      final File file = File(archive);
+      if (await file.exists()) await file.delete();
+    }
+    return _reopen(newEncryption);
+  }
+
+  /// Changes the passphrase of a database encrypted with
+  /// [EncryptionConfig.aes256FromPassphrase], or encrypts a database that
+  /// was not, and returns it opened with the new passphrase. See [rekey].
+  Future<ReaxDB> changePassphrase(
+    String newPassphrase, {
+    int iterations = KeyDerivation.defaultIterations,
+  }) => rekey(
+    EncryptionConfig.aes256FromPassphrase(
+      passphrase: newPassphrase,
+      iterations: iterations,
+    ),
+  );
 
   /// Restores the archive at [archivePath] into a database at [path].
   ///

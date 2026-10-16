@@ -343,6 +343,72 @@ Future<void> _checkRestoreTarget(String path, bool overwrite) async {
 /// Moves a restored database from [staging] to [path], replacing what is
 /// there only when [overwrite] allows it and the target is a ReaxDB
 /// database (or empty), under that database's own lock.
+/// File written into a staging directory once its restore is complete,
+/// before it is moved into place. It tells [_recoverInterruptedRestore]
+/// that the staged database may finish replacing the original.
+const String _restoreCompleteMarker = 'RESTORE_COMPLETE';
+
+/// Finishes or undoes a restore into [path] that a crash interrupted while
+/// swapping directories, so the next open never sees an empty database.
+///
+/// It acts only when [path] is missing or empty, which happens exactly when
+/// the swap stopped between moving the original away and moving the
+/// restored copy in. A complete restore is then moved into place; without
+/// one, the original goes back. When [path] holds a database, original
+/// copies left behind by a finished swap are deleted. Staging directories
+/// without the completion marker are left alone: another process may still
+/// be restoring into them.
+Future<void> _recoverInterruptedRestore(String path) async {
+  final String absolute = p.absolute(path);
+  final Directory parent = Directory(p.dirname(absolute));
+  if (!await parent.exists()) return;
+  final String base = p.basename(absolute);
+  final List<Directory> staged = <Directory>[];
+  final List<Directory> replaced = <Directory>[];
+  // Windows paths compare without regard to case (and the canonical path
+  // is lowercased there).
+  bool startsWith(String name, String prefix) => Platform.isWindows
+      ? name.toLowerCase().startsWith(prefix.toLowerCase())
+      : name.startsWith(prefix);
+  await for (final FileSystemEntity entity in parent.list()) {
+    if (entity is! Directory) continue;
+    final String name = p.basename(entity.path);
+    if (startsWith(name, '$base.importing-')) staged.add(entity);
+    if (startsWith(name, '$base.replaced-')) replaced.add(entity);
+  }
+  if (staged.isEmpty && replaced.isEmpty) return;
+  // The names end in a timestamp: the newest sorts last.
+  int byName(Directory a, Directory b) => a.path.compareTo(b.path);
+  staged.sort(byName);
+  replaced.sort(byName);
+
+  final Directory target = Directory(absolute);
+  final bool targetMissing =
+      !await target.exists() || await target.list().isEmpty;
+  if (targetMissing) {
+    Directory? complete;
+    for (final Directory dir in staged.reversed) {
+      if (await File(p.join(dir.path, _restoreCompleteMarker)).exists()) {
+        complete = dir;
+        break;
+      }
+    }
+    final Directory? source =
+        complete ?? (replaced.isEmpty ? null : replaced.last);
+    if (source == null) return;
+    if (await target.exists()) await _retryWhileBusy(target.delete);
+    await _retryWhileBusy(() => source.rename(absolute));
+    syncDirectory(parent.path);
+    if (identical(source, complete)) staged.remove(source);
+    replaced.remove(source);
+  }
+  final File marker = File(p.join(absolute, _restoreCompleteMarker));
+  if (await marker.exists()) await marker.delete();
+  for (final Directory old in replaced) {
+    await _retryWhileBusy(() => old.delete(recursive: true));
+  }
+}
+
 Future<void> _installRestoredDatabase(
   Directory staging,
   String path,
@@ -357,6 +423,7 @@ Future<void> _installRestoredDatabase(
   if (!await target.exists()) {
     await _retryWhileBusy(() => staging.rename(path));
     syncDirectory(p.dirname(p.absolute(path)));
+    await File(p.join(path, _restoreCompleteMarker)).delete();
     return;
   }
   // Taking the existing database's lock proves no instance has it open, so
@@ -368,9 +435,12 @@ Future<void> _installRestoredDatabase(
   await lock.release();
   final String replaced =
       '$path.replaced-${DateTime.now().microsecondsSinceEpoch}';
+  // A crash between these two renames leaves [path] missing; the next open
+  // finishes the swap (see _recoverInterruptedRestore).
   await _retryWhileBusy(() => target.rename(replaced));
   await _retryWhileBusy(() => staging.rename(path));
   syncDirectory(p.dirname(p.absolute(path)));
+  await File(p.join(path, _restoreCompleteMarker)).delete();
   await _retryWhileBusy(() => Directory(replaced).delete(recursive: true));
 }
 
@@ -569,6 +639,15 @@ Future<ReaxDB> _importArchive({
     }
     await restored.close();
     db = null;
+    // Durable before the swap: it is what lets a crash midway be finished.
+    final File marker = File(p.join(staging.path, _restoreCompleteMarker));
+    final RandomAccessFile markerFile = await marker.open(mode: FileMode.write);
+    try {
+      await markerFile.flush();
+    } finally {
+      await markerFile.close();
+    }
+    syncDirectory(staging.path);
     await _installRestoredDatabase(staging, path, overwrite);
   } catch (_) {
     await db?.close();

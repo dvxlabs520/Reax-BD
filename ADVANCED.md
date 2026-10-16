@@ -433,6 +433,30 @@ Details:
 
 `db.encryptionInfo` reports the **effective** algorithm, never a requested one.
 
+### Changing the key
+
+`db.rekey(newConfig)` (2.5.0) re-encrypts every value and returns the
+database opened with `newConfig` and the options it was opened with. The
+instance it is called on is closed. `changePassphrase(newPassphrase)` is
+`rekey` with a passphrase configuration. Both also work to start
+encrypting a database, and `rekey(EncryptionConfig.none())` removes
+encryption.
+
+How it works, and what it guarantees:
+
+- The data is exported to an archive next to the database, encrypted with
+  a random key that exists only in memory, then restored into a temporary
+  directory that replaces the database once complete. No plaintext reaches
+  the disk, even when removing encryption from a database that has it.
+- A crash at any point leaves a database that opens with either the old
+  configuration or the new one, never a mix. Open with the new one first if
+  you do not know whether a rekey finished.
+- Every value is written again, so values written by 2.0.0 (envelope
+  version 0x01, not bound to their key) are bound to it afterwards.
+- It needs free space for about two more copies of the data.
+- On failure the database keeps its old configuration. The instance stays
+  closed; open the database again.
+
 ## TTL and expiry
 
 ```dart
@@ -569,7 +593,10 @@ can read.
 
 `importFrom` verifies the digest over the whole file first, restores in
 batches into a temporary sibling directory, recreates the indexes and only
-then moves the result into place. With `overwrite: true` it replaces only a
+then moves the result into place. Replacing an existing database takes two
+renames. Since 2.5.0 a crash between them is recovered on the next open: a
+complete restore (marked by a `RESTORE_COMPLETE` file written before the
+swap) is moved into place, and otherwise the original goes back. With `overwrite: true` it replaces only a
 ReaxDB database that no instance has open, never any other directory.
 Archives written by 2.0 (format version 1) are still restored.
 

@@ -16,12 +16,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Values read are copies, so changing one never changes the stored value.
   Opening loads every entry, so it takes longer and memory use grows with
   the data.
+- `rekey(newEncryption)` and `changePassphrase(newPassphrase)` re-encrypt
+  every value and return the database opened with the new configuration.
+  No plaintext reaches the disk, a crash leaves the database readable with
+  either the old or the new configuration, and values written by 2.0.0 are
+  bound to their key afterwards.
 - `getSync()` reads a value synchronously from a database opened with
   `keepInMemory: true`, for example in a Flutter `build` method.
 - `benchmark/hive_comparison.dart`: ReaxDB and Hive (`hive_ce`) measured on
   the same machine with the same documents.
 
+### Fixed
+
+- A crash between the two renames that `importFrom(overwrite: true)` uses
+  to replace a database left the path missing, so the next open created an
+  empty database. The next open now finishes the swap when the restore was
+  complete, and puts the original back otherwise.
+
 ### Changed
+
+- Opening with `keepInMemory: true` reads each SSTable with one I/O instead
+  of streaming entry by entry: about 168 ms instead of 306 ms for 100,000
+  documents.
 
 - Flushing a full memtable and compacting the LSM tree now happen in the
   background, after the write that triggered them has returned, instead of
