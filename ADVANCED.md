@@ -15,6 +15,7 @@ has limits, the limits are stated.
 - [Storage engine](#storage-engine)
 - [Cache](#cache)
 - [Keeping every value in memory](#keeping-every-value-in-memory)
+- [Running the engine in a background isolate](#running-the-engine-in-a-background-isolate)
 - [Queries, indexes and the total order](#queries-indexes-and-the-total-order)
 - [Encryption](#encryption)
 - [TTL and expiry](#ttl-and-expiry)
@@ -337,6 +338,91 @@ Use it for data that fits comfortably in memory and is read far more often
 than it is written: settings, a user's documents, a catalogue. Keep the
 default for large databases or data that is mostly written.
 
+## Running the engine in a background isolate
+
+```dart
+final db = await ReaxDB.open(
+  path: '/data/app',
+  background: true,
+  keepInMemory: true, // optional: values stay in this isolate
+);
+```
+
+Added in 2.6.0. Dart runs everything in an isolate on one thread. Flushes
+and compactions already run after the write that triggers them, but in the
+same isolate, so a long compaction still takes the thread from a Flutter UI
+for several milliseconds at a time. With `background: true` the engine runs
+in an isolate of its own: the write-ahead log, the LSM tree, flushes,
+compactions, encryption and decryption, value encoding, the record cache,
+secondary indexes and transactions. The isolate that opened the database
+only exchanges messages with it.
+
+The object returned is an ordinary `ReaxDB`, and everything else in this
+guide applies unchanged: durability, isolation levels, the write pipeline,
+errors. The option is off by default.
+
+How each part behaves:
+
+- **Calls** are messages to the engine and back. Values are copied by the
+  VM when they are sent (both isolates belong to one isolate group, so no
+  codec is involved), and each call costs a round trip of a few
+  microseconds. A value the VM cannot send (one holding a `ReceivePort`, for
+  example) fails with `SerializationException`, as a value the codec cannot
+  encode does.
+- **Order is kept.** The engine sends the effects of a call (memory
+  updates, change events, log records) before its reply. When an awaited
+  write returns, `getSync` and every change-stream listener have already
+  seen it.
+- **`keepInMemory`** keeps the values in the CALLING isolate, so `getSync`
+  stays synchronous: `get`, `getSync`, `getBatch`, `exists`, `scan`,
+  `scanPrefix`, `keys` and `range` never wait for the engine. The engine
+  loads them at open, decrypts them, and sends every committed write
+  afterwards, including transactions and TTL reclamation. The engine itself
+  does not keep a second copy: its queries read the LSM tree and its cache.
+- **Change streams** are delivered by a hub in the calling isolate, with
+  the same buffering, pause and `ChangeStreamOverflowException` as without
+  this option. The engine forwards an event only while some subscription
+  wants it, and only once even when several patterns match.
+- **Transactions.** The body runs in the calling isolate, in the zone that
+  called `transaction`, against a `ReaxTransaction` whose reads and writes
+  go to the engine. The engine decides commits and retries exactly as
+  before, so a conflict runs the body again. The value the body returns
+  never crosses isolates, and an error the body throws is rethrown as the
+  same object.
+- **Queries** run in the engine, with its indexes: the builder's conditions
+  are sent when `find`, `count`, `update` or another terminal method runs.
+- **Callbacks stay here.** `onUpgrade` runs in the calling isolate with the
+  database, and the `logOutputs` you pass receive the engine's records
+  there, filtered by `logLevel` and by later changes to `db.logger`.
+- **Statistics.** `cacheStats`, `storageStats`, `transactionStats` and
+  `statistics()` are synchronous, so they return the counters as of the
+  engine's last reply. Each reply carries them.
+- **Locking** is unchanged: the engine takes the same locks, and a second
+  open of the same path in the calling isolate fails as before.
+  `ReaxDB.closeAll()` closes background databases too.
+- **Closing** waits until the engine isolate has exited. If the engine
+  isolate dies without being closed, calls in flight and later calls fail
+  with `StorageException`, and the change streams end.
+- **Nothing keeps the process alive.** The calling isolate's port keeps it
+  alive only while a call is waiting for its reply, and there are no
+  timers. A program that returns from `main` without closing a background
+  database exits, as it does with a local one.
+
+The costs. With `keepInMemory`, opening briefly holds the values twice,
+while the engine hands its loaded copy to the calling isolate. Every call
+pays the round trip, so sequential small writes with
+`SyncMode.none` and reads without `keepInMemory` are slower than in the same
+isolate. Durable writes, which wait for an `fsync`, and batches are about
+the same. The calling isolate is then free for all but a few milliseconds
+at a time; what remains is mostly garbage collection, which an isolate group
+shares. See [BENCHMARKS.md](BENCHMARKS.md#background-isolate) for measured
+numbers.
+
+Use it in a Flutter app that writes while the UI runs: imports, sync
+engines, logging. A command-line tool or a server gains little from it.
+`importFrom` returns a database in the calling isolate; reopen it with
+`background: true` if you need that.
+
 ## Queries, indexes and the total order
 
 All value comparisons — conditions, `orderBy`, aggregation, `distinct`,
@@ -534,7 +620,10 @@ messages.
 
 ## Concurrency model
 
-A database is used from one isolate at a time. Within that isolate:
+A database is used from one isolate at a time: the one that opened it, or
+with `background: true` its engine isolate, which serves the opener (see
+[Running the engine in a background isolate](#running-the-engine-in-a-background-isolate)).
+Within that isolate:
 
 - The storage engine serializes every mutation, flush, compaction and close.
 - The transaction manager serializes commits behind one mutex.

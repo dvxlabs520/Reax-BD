@@ -11,6 +11,7 @@
 // Every operation is timed on its own. The first 10% of samples of each
 // repetition are discarded as warmup, each scenario runs --runs times on a
 // fresh database, and the median repetition (by throughput) is reported.
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
@@ -181,7 +182,108 @@ Future<ReaxDB> _reax(
   String path, {
   SyncMode sync = SyncMode.full,
   bool memory = false,
-}) => ReaxDB.open(path: '$path/reax', syncMode: sync, keepInMemory: memory);
+  bool background = false,
+}) => ReaxDB.open(
+  path: '$path/reax',
+  syncMode: sync,
+  keepInMemory: memory,
+  background: background,
+);
+
+/// The longest the calling isolate went without running a 1 ms timer while
+/// a scenario ran: how long a UI thread doing the same work would freeze.
+final class _StallProbe {
+  _StallProbe() {
+    _timer = Timer.periodic(const Duration(milliseconds: 1), (_) {
+      final int now = _clock.elapsedMicroseconds;
+      if (now - _last > _worst) _worst = now - _last;
+      _last = now;
+    });
+  }
+
+  final Stopwatch _clock = Stopwatch()..start();
+  late final Timer _timer;
+  int _last = 0;
+  int _worst = 0;
+
+  String stop() {
+    _timer.cancel();
+    return 'max stall ${(_worst / 1000).toStringAsFixed(1)} ms';
+  }
+}
+
+Future<_Result> _writes(
+  String p,
+  int n, {
+  SyncMode sync = SyncMode.full,
+  bool memory = false,
+  bool background = false,
+  String note = '',
+}) async {
+  final ReaxDB db = await _reax(
+    p,
+    sync: sync,
+    memory: memory,
+    background: background,
+  );
+  final _Recorder r = _Recorder(n);
+  final _StallProbe probe = _StallProbe();
+  for (int i = 0; i < n; i++) {
+    await r.time(() => db.put(_key(i), _doc(i)));
+  }
+  return r.finish(note: '${note.isEmpty ? '' : '$note, '}${probe.stop()}');
+}
+
+Future<_Result> _batches(String p, int n, {bool background = false}) async {
+  final ReaxDB db = await _reax(p, background: background);
+  final _Recorder r = _Recorder(n ~/ _batchSize);
+  final _StallProbe probe = _StallProbe();
+  for (int start = 0; start < n; start += _batchSize) {
+    final Map<String, Object?> batch = <String, Object?>{
+      for (int i = start; i < min(n, start + _batchSize); i++) _key(i): _doc(i),
+    };
+    await r.time(() => db.putBatch(batch));
+  }
+  return r.finish(
+    itemsPerSample: _batchSize,
+    note: '${background ? 'background, ' : ''}${probe.stop()}',
+  );
+}
+
+Future<_Result> _warmGets(
+  String p,
+  int n,
+  int rep, {
+  bool memory = false,
+  bool background = false,
+  bool sync = false,
+}) async {
+  final ReaxDB db = await _reax(p, memory: memory, background: background);
+  await _fillReax(db, n);
+  for (final int i in _shuffled(n, rep)) {
+    await db.get<Map<String, dynamic>>(_key(i));
+  }
+  final List<int> order = _shuffled(n, rep + 100);
+  final _Recorder r = _Recorder(0);
+  await r.timeLoop(() async {
+    for (final int i in order) {
+      if (sync) {
+        db.getSync<Map<String, dynamic>>(_key(i));
+      } else {
+        await db.get<Map<String, dynamic>>(_key(i));
+      }
+    }
+  });
+  return r.finish(
+    itemsPerSample: n,
+    note: <String>[
+      if (background) 'background',
+      if (memory) 'keepInMemory: true',
+      if (!memory)
+        'cache hit ratio ${db.cacheStats.hitRatio.toStringAsFixed(2)}',
+    ].join(', '),
+  );
+}
 
 Future<Box<Map<dynamic, dynamic>>> _hive(String path) async {
   Hive.init('$path/hive');
@@ -229,22 +331,25 @@ final class _Scenario {
 final List<_Scenario> _scenarios = <_Scenario>[
   // Single writes. "Durable" means flushed to disk before the call returns:
   // ReaxDB's default, and put + flush() in Hive.
-  _Scenario('write, durable   ReaxDB full', (p, n, _) async {
-    final ReaxDB db = await _reax(p);
-    final _Recorder r = _Recorder(n);
-    for (int i = 0; i < n; i++) {
-      await r.time(() => db.put(_key(i), _doc(i)));
-    }
-    return r.finish();
-  }),
-  _Scenario('write, durable   ReaxDB memory', (p, n, _) async {
-    final ReaxDB db = await _reax(p, memory: true);
-    final _Recorder r = _Recorder(n);
-    for (int i = 0; i < n; i++) {
-      await r.time(() => db.put(_key(i), _doc(i)));
-    }
-    return r.finish(note: 'keepInMemory: true');
-  }),
+  _Scenario('write, durable   ReaxDB full', (p, n, _) => _writes(p, n)),
+  _Scenario(
+    'write, durable   ReaxDB background',
+    (p, n, _) => _writes(p, n, background: true, note: 'background: true'),
+  ),
+  _Scenario(
+    'write, durable   ReaxDB memory',
+    (p, n, _) => _writes(p, n, memory: true, note: 'keepInMemory: true'),
+  ),
+  _Scenario(
+    'write, durable   ReaxDB bg memory',
+    (p, n, _) => _writes(
+      p,
+      n,
+      memory: true,
+      background: true,
+      note: 'background, keepInMemory',
+    ),
+  ),
   _Scenario('write, durable   Hive put+flush', (p, n, _) async {
     final Box<Map<dynamic, dynamic>> box = await _hive(p);
     final _Recorder r = _Recorder(n);
@@ -264,14 +369,20 @@ final List<_Scenario> _scenarios = <_Scenario>[
     }
     return r.finish(note: 'survives an app kill');
   }),
-  _Scenario('write            ReaxDB none', (p, n, _) async {
-    final ReaxDB db = await _reax(p, sync: SyncMode.none);
-    final _Recorder r = _Recorder(n);
-    for (int i = 0; i < n; i++) {
-      await r.time(() => db.put(_key(i), _doc(i)));
-    }
-    return r.finish(note: 'no guarantee');
-  }),
+  _Scenario(
+    'write            ReaxDB none',
+    (p, n, _) => _writes(p, n, sync: SyncMode.none, note: 'no guarantee'),
+  ),
+  _Scenario(
+    'write            ReaxDB bg none',
+    (p, n, _) => _writes(
+      p,
+      n,
+      sync: SyncMode.none,
+      background: true,
+      note: 'background, no guarantee',
+    ),
+  ),
   _Scenario('write            Hive put', (p, n, _) async {
     final Box<Map<dynamic, dynamic>> box = await _hive(p);
     final _Recorder r = _Recorder(n);
@@ -281,18 +392,11 @@ final List<_Scenario> _scenarios = <_Scenario>[
     return r.finish(note: 'no flush');
   }),
   // Batches of 500.
-  _Scenario('batch, durable   ReaxDB putBatch', (p, n, _) async {
-    final ReaxDB db = await _reax(p);
-    final _Recorder r = _Recorder(n ~/ _batchSize);
-    for (int start = 0; start < n; start += _batchSize) {
-      final Map<String, Object?> batch = <String, Object?>{
-        for (int i = start; i < min(n, start + _batchSize); i++)
-          _key(i): _doc(i),
-      };
-      await r.time(() => db.putBatch(batch));
-    }
-    return r.finish(itemsPerSample: _batchSize);
-  }),
+  _Scenario('batch, durable   ReaxDB putBatch', (p, n, _) => _batches(p, n)),
+  _Scenario(
+    'batch, durable   ReaxDB bg putBatch',
+    (p, n, _) => _batches(p, n, background: true),
+  ),
   _Scenario('batch, durable   Hive putAll+flush', (p, n, _) async {
     final Box<Map<dynamic, dynamic>> box = await _hive(p);
     final _Recorder r = _Recorder(n ~/ _batchSize);
@@ -360,6 +464,19 @@ final List<_Scenario> _scenarios = <_Scenario>[
     });
     return r.finish(itemsPerSample: n, note: 'synchronous, from memory');
   }),
+  _Scenario(
+    'read, warm       ReaxDB bg get',
+    (p, n, rep) => _warmGets(p, n, rep, background: true),
+  ),
+  _Scenario(
+    'read, warm       ReaxDB bg memory get',
+    (p, n, rep) => _warmGets(p, n, rep, memory: true, background: true),
+  ),
+  _Scenario(
+    'read, warm       ReaxDB bg getSync',
+    (p, n, rep) =>
+        _warmGets(p, n, rep, memory: true, background: true, sync: true),
+  ),
   _Scenario('read, warm       Hive get', (p, n, rep) async {
     final Box<Map<dynamic, dynamic>> box = await _hive(p);
     await _fillHive(box, n);
@@ -437,6 +554,17 @@ final List<_Scenario> _scenarios = <_Scenario>[
     await reopened.close();
     return r.finish(note: 'loads every document');
   }),
+  _Scenario('open             ReaxDB bg memory', (p, n, _) async {
+    final ReaxDB db = await _reax(p);
+    await _fillReax(db, n);
+    await db.close();
+    final _Recorder r = _Recorder(1);
+    final ReaxDB reopened = await r.time(
+      () => _reax(p, memory: true, background: true),
+    );
+    await reopened.close();
+    return r.finish(note: 'background, loads every document');
+  }),
   _Scenario('open             Hive', (p, n, _) async {
     final Box<Map<dynamic, dynamic>> box = await _hive(p);
     await _fillHive(box, n);
@@ -504,6 +632,19 @@ final List<_Scenario> _scenarios = <_Scenario>[
       );
     }
     return r.finish(note: 'ops/s = queries per second');
+  }),
+  _Scenario('query            ReaxDB bg indexed', (p, n, _) async {
+    final ReaxDB db = await _reax(p, background: true);
+    await db.createIndex('doc', <String>['category']);
+    await _fillReax(db, n);
+    final _Recorder r = _Recorder(20);
+    for (int q = 0; q < 20; q++) {
+      final String category = _categories[q % _categories.length];
+      await r.time(
+        () => db.query('doc').whereEquals('category', category).find(),
+      );
+    }
+    return r.finish(note: 'background, queries per second');
   }),
   _Scenario('query            ReaxDB memory indexed', (p, n, _) async {
     final ReaxDB db = await _reax(p, memory: true);

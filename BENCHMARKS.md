@@ -137,6 +137,63 @@ What this shows:
 These are numbers for one machine and one document shape. Benchmark your
 own data before deciding.
 
+## Background isolate
+
+Measured on 17 October 2026 with the same AOT build of
+[`benchmark/hive_comparison.dart`](benchmark/hive_comparison.dart), local
+and `background: true` in the same run, three repetitions, median reported.
+The machine was busy with an unrelated build (load average 4-6 on 15 cores),
+so treat these numbers as indicative: repeated runs moved durable writes by
+up to 30%. "Max stall" is the longest the calling isolate went without
+running a 1 ms timer while the scenario ran, which is how long a UI thread
+doing the same work would have frozen.
+
+**100,000 documents**
+
+| Scenario | Same isolate | `background: true` |
+| --- | ---: | ---: |
+| Durable write, one at a time | 18.0-19.1k/s, max stall 21 ms | 14.3-17.4k/s, max stall 3-58 ms |
+| Durable write, `keepInMemory` | 18.7-19.0k/s, max stall 20 ms | 13.6-16.5k/s, max stall 4 ms |
+| Write, `SyncMode.none` | 134.5k/s, max stall 23 ms | 75.6k/s, max stall 4 ms |
+| Durable batch of 500 | 176-203k/s, max stall 22-26 ms | 179-198k/s, max stall 4.5 ms |
+| Read, warm, no memory (cache misses) | 42.2k/s | 32.7-36.9k/s |
+| Read, warm, `keepInMemory` `get` | 0.96-1.14M/s | 0.38-0.83M/s |
+| Read, warm, `getSync` | 1.06-1.11M/s | 0.74-0.91M/s |
+| Open, `keepInMemory` | 180 ms | 327 ms |
+| Indexed query, 20,000 results | 440 ms | 457 ms |
+
+**10,000 documents**
+
+| Scenario | Same isolate | `background: true` |
+| --- | ---: | ---: |
+| Durable write, one at a time | 21.8k/s | 19.6k/s |
+| Write, `SyncMode.none` | 207.4k/s, max stall 4.4 ms | 125.0k/s, max stall 2.3 ms |
+| Durable batch of 500 | 335.7k/s | 317.2k/s |
+| Read, warm, cache hits | 1.03M/s | 0.22M/s |
+| Read, warm, `getSync` | 2.15M/s | 1.32M/s |
+| Indexed query, 2,000 results | 4.5 ms | 4.9 ms |
+
+What this shows:
+
+- **The calling isolate stops freezing.** At 100,000 documents a flush or
+  compaction blocks a same-isolate caller for 20-26 ms; in background mode
+  the longest stall is about 4 ms in almost every run. The one exception,
+  durable writes without `keepInMemory`, stalled 3 ms in one run and
+  24-58 ms in others: isolates spawned with `Isolate.spawn` share one heap,
+  so a large garbage collection in the engine also pauses the caller.
+- **Durable writes and batches cost about the same**: the fsync dominates.
+- **Each call pays a round trip of about 4-5 us**, which shows on the
+  cheapest operations: `SyncMode.none` writes run at about 60% of the
+  same-isolate rate, and reads served by the engine's cache at about a fifth.
+  Use `keepInMemory` for read-heavy data: those reads never leave the
+  calling isolate.
+- **Reads from memory are somewhat slower** than in the same isolate while
+  the engine is busy (here, compacting after the bulk load), for the same
+  shared-heap reason.
+- **Opening with `keepInMemory` takes longer** (327 ms against 180 ms at
+  100,000 documents), because the loaded values are copied to the calling
+  isolate.
+
 ## 2.1.0 against 2.0.0
 
 At 100,000 documents, both versions built AOT on the same machine:

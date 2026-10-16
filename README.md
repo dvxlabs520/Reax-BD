@@ -78,7 +78,7 @@ Both are pure Dart. This table compares documented features, with
 | Entries that expire (TTL) | Yes | No |
 | Typed objects | `toJson`/`fromJson`, no code generation | `TypeAdapter`s, usually generated |
 | Reads | Cached, data on disk; or every value in memory with `keepInMemory: true` (2.5.0) | Normal boxes keep every value in memory |
-| Background isolate | No | Yes (`IsolatedHive`) |
+| Background isolate | Yes, `background: true` (2.6.0) | Yes (`IsolatedHive`) |
 | Web | No | Yes (IndexedDB) |
 
 Speed, measured on the same machine with 100,000 documents (details and
@@ -261,6 +261,21 @@ final theme = db.getSync<String>('settings:theme'); // no await, e.g. in build()
 Reads and queries then never touch the disk. Writes are still saved to disk
 first, exactly as before. Opening takes longer, because it loads everything.
 See [ADVANCED.md](ADVANCED.md#keeping-every-value-in-memory).
+
+### Keep the UI isolate free (2.6.0)
+
+```dart
+final db = await ReaxDB.open(
+  path: '/absolute/path/to/data',
+  background: true,
+  keepInMemory: true, // optional; getSync keeps working
+);
+```
+
+The engine (write-ahead log, flushes and compactions, encryption, indexes)
+then runs in an isolate of its own, so a long compaction never freezes the
+UI. The API is the same; each call costs a few microseconds more. See
+[ADVANCED.md](ADVANCED.md#running-the-engine-in-a-background-isolate).
 
 ### Faster writes when you can afford to lose the last ones
 

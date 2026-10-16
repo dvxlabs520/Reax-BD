@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Planned as 2.6.0. Compatible with 2.5: the API, the defaults and the on-disk
+format are unchanged.
+
+### Added
+
+- `ReaxDB.open(background: true)` runs the engine in a background isolate:
+  the write-ahead log, flushes and compactions, encryption, the cache,
+  indexes and transactions. The returned `ReaxDB` works as before, and the
+  calling isolate is no longer blocked by maintenance (the longest stall
+  measured while writing fell from about 20 ms to about 2 ms). With
+  `keepInMemory: true` the values stay in the calling isolate, so `getSync`
+  remains synchronous. Transaction bodies, `onUpgrade` and log outputs run
+  in the calling isolate; queries run in the engine. Each call costs a round
+  trip between isolates of a few microseconds. See "Running the engine in a
+  background isolate" in `ADVANCED.md`.
+- `benchmark/hive_comparison.dart` measures the background mode and reports
+  the longest stall of the calling isolate during writes.
+
 ## [2.5.0] - 2026-10-16
 
 Faster where it matters for apps: an in-memory mode for reads, writes that
