@@ -4,7 +4,7 @@ An embedded NoSQL database for Dart, written in pure Dart with no native
 dependencies.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dvillegastech/Reax-BD)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/dvxlabs520/Reax-BD)
 
 > **Upgrading from 1.x?** 2.0 rewrote the storage engine and the public
 > API. Your 1.x data migrates (encrypted data too) and most 1.x code still
@@ -439,7 +439,7 @@ Nothing is swallowed into a `null` or an empty result.
 ## Contributing
 
 Issues and pull requests are welcome at
-<https://github.com/dvillegastech/Reax-BD>. A bug fix should come with a test
+<https://github.com/dvxlabs520/Reax-BD>. A bug fix should come with a test
 that fails before it and passes after.
 
 ## License
