@@ -14,10 +14,20 @@ library;
 /// `id` field are updated in place instead of being duplicated.
 final class DocumentRecord {
   /// Creates a record for [document] stored under [id].
-  const DocumentRecord(this.id, this.document);
+  DocumentRecord(String id, this.document) : _id = id, _key = id, _offset = 0;
+
+  /// Creates a record for [document] stored under [key], whose id starts at
+  /// [offset]. The id is cut out only if someone asks for it.
+  DocumentRecord.fromKey(String key, int offset, this.document)
+    : _key = key,
+      _offset = offset;
+
+  final String _key;
+  final int _offset;
+  String? _id;
 
   /// The id component of the storage key (`collection:id`).
-  final String id;
+  String get id => _id ??= _key.substring(_offset);
 
   /// The decoded document.
   final Map<String, dynamic> document;
@@ -29,6 +39,25 @@ final class DocumentRecord {
 /// `StorageEngine.scan` over the collection key prefix, so every document is
 /// visible regardless of its id shape (string ids, large numeric ids, UUIDs).
 abstract interface class DocumentStore {
+  /// Whether the documents this store yields are the stored objects
+  /// themselves rather than fresh copies. The query layer then copies
+  /// whatever it hands to a caller, and never changes what it reads.
+  bool get sharesDocuments;
+
+  /// Calls [visit] with every live document of [collection] in key order,
+  /// synchronously, until it returns false. Returns false, without calling
+  /// [visit], when this store can only stream them ([scanDocuments]).
+  ///
+  /// [visit] must not await: the walk sees the store as it is right now.
+  bool visitDocumentsNow(
+    String collection,
+    bool Function(DocumentRecord record) visit,
+  );
+
+  /// The live documents of [ids], synchronously, or null when this store
+  /// can only load them asynchronously ([getDocuments]).
+  List<DocumentRecord>? getDocumentsNow(String collection, List<String> ids);
+
   /// Streams every document of [collection] in storage key order.
   Stream<DocumentRecord> scanDocuments(String collection);
 

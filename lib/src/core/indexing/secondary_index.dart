@@ -43,6 +43,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../errors/exceptions.dart';
+import '../util/code_point_order.dart';
 
 /// Reserved key prefix for index entry keys: `0x00 i d x 0x00`.
 final Uint8List indexEntryPrefix = Uint8List.fromList(const [
@@ -147,6 +148,7 @@ void validateCollectionName(String collection) {
 /// the index writer and the query scanner use this extractor, so nested
 /// fields behave identically on either path.
 dynamic extractFieldValue(Map<String, dynamic> document, String path) {
+  if (!path.contains('.')) return document[path];
   dynamic value = document;
   for (final String part in path.split('.')) {
     if (value is Map<String, dynamic>) {
@@ -382,6 +384,10 @@ final class IndexValueCodec {
 /// comparator and the on-disk index ordering can never diverge.
 int compareValues(dynamic a, dynamic b) {
   if (identical(a, b)) return 0;
+  // Scalars are compared directly, with the same result as the encodings
+  // and without building them: queries compare once per document.
+  final int? scalar = _compareScalars(a, b);
+  if (scalar != null) return scalar;
   final int encoded = compareBytes(
     IndexValueCodec.encodeValue(a),
     IndexValueCodec.encodeValue(b),
@@ -391,6 +397,47 @@ int compareValues(dynamic a, dynamic b) {
   // that round to the same double; break those ties exactly, inside lists
   // and maps too.
   return _compareExactTies(a, b);
+}
+
+/// [compareValues] for null, bools, numbers and strings, or null for any
+/// other value (and for NaN), which go through the encodings.
+///
+/// Mirrors [IndexValueCodec]: the type tags order null < bool < number <
+/// string; numbers compare as doubles with exact ties broken like
+/// [_compareNumbersExactly]; strings compare by code point, the order of
+/// their escaped UTF-8 bytes.
+int? _compareScalars(dynamic a, dynamic b) {
+  final int rankA = _scalarRank(a);
+  final int rankB = _scalarRank(b);
+  if (rankA < 0 || rankB < 0) return null;
+  if (rankA != rankB) return rankA - rankB;
+  switch (rankA) {
+    case 0:
+      return 0;
+    case 1:
+      return (a as bool ? 1 : 0) - (b as bool ? 1 : 0);
+    case 2:
+      final num x = a as num;
+      final num y = b as num;
+      // Rounding to double is monotonic, so ints compare exactly as ints.
+      if (x is int && y is int) return x.compareTo(y);
+      final double dx = x.toDouble();
+      final double dy = y.toDouble();
+      if (dx.isNaN || dy.isNaN) return null;
+      if (dx < dy) return -1;
+      if (dx > dy) return 1;
+      return _compareNumbersExactly(x, y);
+    default:
+      return compareCodePoints(a as String, b as String);
+  }
+}
+
+int _scalarRank(dynamic value) {
+  if (value == null) return 0;
+  if (value is bool) return 1;
+  if (value is num) return 2;
+  if (value is String) return 3;
+  return -1;
 }
 
 int _compareExactTies(dynamic a, dynamic b) {

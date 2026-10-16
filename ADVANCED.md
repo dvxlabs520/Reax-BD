@@ -14,6 +14,7 @@ has limits, the limits are stated.
 - [Key space and the reserved 0x00 prefix](#key-space-and-the-reserved-0x00-prefix)
 - [Storage engine](#storage-engine)
 - [Cache](#cache)
+- [Keeping every value in memory](#keeping-every-value-in-memory)
 - [Queries, indexes and the total order](#queries-indexes-and-the-total-order)
 - [Encryption](#encryption)
 - [TTL and expiry](#ttl-and-expiry)
@@ -268,6 +269,60 @@ One LRU cache with per-entry TTL, bounded by entry count and by memory.
 
 `db.cacheStats` reports hits, misses, evictions, expirations, entry count,
 memory and hit ratio.
+
+Every cache hit still decodes the envelope (for a document, a `jsonDecode`),
+and a database larger than `cacheMaxEntries` mostly misses. When reads matter
+more than memory, keep every value in memory instead.
+
+## Keeping every value in memory
+
+```dart
+final db = await ReaxDB.open(path: '/data/app', keepInMemory: true);
+
+final user = db.getSync<Map<String, dynamic>>('user:1'); // no await
+```
+
+Added in 2.5.0. With `keepInMemory: true` the database keeps a decoded copy
+of every entry in memory, like a Hive box:
+
+- **Reads come from memory.** `get`, `getSync`, `getBatch`, `exists`,
+  `scan`, `scanPrefix`, `keys`, `range`, `info` and queries never touch the
+  disk and never decode. The record cache is not used, so `cacheStats`
+  stays at zero.
+- **Writes are unchanged.** Each write goes to the write-ahead log first,
+  with the same durability as without this option. Memory is updated after
+  the durability point, in the same pipeline step as the cache would be, so
+  a read never sees a write that is not on disk. An indexed write also takes
+  the previous document from memory instead of reading it from disk.
+- **Values are copies.** Everything a read returns is a deep copy, so
+  changing a map you read never changes the stored value. The value you pass
+  to `put` is not kept either: memory holds the value decoded from what was
+  written, with exactly the types a read from disk returns (`List<int>`
+  reads back as `Uint8List`, maps as `Map<String, dynamic>`).
+- **Scans are snapshots.** A scan sees the entries as they were when it
+  started, as a scan of the storage engine does.
+- **Expiry works the same.** An expired entry reads as absent and is
+  reclaimed through the write pipeline. It stays in memory until then,
+  because memory mirrors exactly what is stored.
+- **`getSync`** reads one value without a `Future`, for example in a
+  Flutter `build` method. It throws `UnsupportedApiException` on a database
+  opened without `keepInMemory`.
+
+The costs:
+
+- **Opening reads and decodes every entry**, so it takes time in
+  proportion to the data. See [BENCHMARKS.md](BENCHMARKS.md) for measured
+  open times.
+- **Memory grows with the data**: roughly the size of the decoded values,
+  plus a key and two references per entry. Measure your own data before
+  using this on large databases on a phone.
+- **Queries copy their results.** Hive returns the objects it stores; this
+  mode returns copies, which costs time in proportion to the number of
+  results.
+
+Use it for data that fits comfortably in memory and is read far more often
+than it is written: settings, a user's documents, a catalogue. Keep the
+default for large databases or data that is mostly written.
 
 ## Queries, indexes and the total order
 

@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2.5.0
+
+### Added
+
+- `ReaxDB.open(keepInMemory: true)` keeps every value decoded in memory,
+  like a Hive box. `get`, `exists`, `scan`, `scanPrefix`, `keys`, `range`
+  and queries are served from memory, without disk access or decoding.
+  Writes still go to the write-ahead log first, with the same durability.
+  Values read are copies, so changing one never changes the stored value.
+  Opening loads every entry, so it takes longer and memory use grows with
+  the data.
+- `getSync()` reads a value synchronously from a database opened with
+  `keepInMemory: true`, for example in a Flutter `build` method.
+- `benchmark/hive_comparison.dart`: ReaxDB and Hive (`hive_ce`) measured on
+  the same machine with the same documents.
+
+### Changed
+
+- Queries no longer await once per document. Each matching document now
+  costs a plain loop iteration when the documents are in memory, and one
+  await per chunk on the index path.
+
 ## [2.1.1] - 2026-10-16
 
 Documentation only. No code changes.

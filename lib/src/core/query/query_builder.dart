@@ -1,6 +1,7 @@
 /// Fluent query building and execution.
 library;
 
+import '../cache/memory_store.dart' show copyValue;
 import '../errors/exceptions.dart';
 import '../indexing/index_manager.dart';
 import '../indexing/secondary_index.dart';
@@ -199,7 +200,7 @@ class QueryBuilder {
   Future<List<Map<String, dynamic>>> find() async {
     final List<DocumentRecord> records = await _findRecords();
     final List<Map<String, dynamic>> results = [
-      for (final DocumentRecord record in records) record.document,
+      for (final DocumentRecord record in records) _output(record.document),
     ];
     if (_joins.isNotEmpty) {
       await _applyJoins(results);
@@ -214,7 +215,9 @@ class QueryBuilder {
   Future<Map<String, dynamic>?> findOne() async {
     final List<DocumentRecord> records = await _findRecords(limitOverride: 1);
     if (records.isEmpty) return null;
-    final List<Map<String, dynamic>> results = [records.first.document];
+    final List<Map<String, dynamic>> results = [
+      _output(records.first.document),
+    ];
     if (_joins.isNotEmpty) {
       await _applyJoins(results);
     }
@@ -235,9 +238,10 @@ class QueryBuilder {
       return _applyWindowToCount(total);
     }
     int matched = 0;
-    await for (final DocumentRecord _ in _matchingRecords()) {
+    await _forEachMatching((DocumentRecord _) {
       matched++;
-    }
+      return true;
+    });
     return _applyWindowToCount(matched);
   }
 
@@ -275,7 +279,7 @@ class QueryBuilder {
     final List<DocumentRecord> records = await _findRecords();
     for (final DocumentRecord record in records) {
       await _store.putDocument(collection, record.id, {
-        ...record.document,
+        ..._output(record.document),
         ...updates,
       });
     }
@@ -293,6 +297,13 @@ class QueryBuilder {
 
   // --- execution ---------------------------------------------------------
 
+  /// [document] as it may be handed to a caller: a copy when the store
+  /// shares its stored objects.
+  Map<String, dynamic> _output(Map<String, dynamic> document) =>
+      _store.sharesDocuments
+      ? copyValue(document) as Map<String, dynamic>
+      : document;
+
   int _applyWindowToCount(int matched) {
     final int afterOffset = (matched - (_offsetValue ?? 0)).clamp(0, matched);
     final int? limitValue = _limitValue;
@@ -301,12 +312,17 @@ class QueryBuilder {
         : (afterOffset > limitValue ? limitValue : afterOffset);
   }
 
-  /// Streams matching records (unordered, no offset/limit applied).
+  /// Calls [visit] with every matching record (unordered, no offset/limit
+  /// applied) until it returns false.
   ///
   /// On the index path candidates are consumed lazily and loaded in chunks,
   /// so a caller that stops early (a `limit` without `orderBy`, `findOne`)
-  /// also stops the index scan.
-  Stream<DocumentRecord> _matchingRecords() async* {
+  /// also stops the index scan. A store that can hand its documents over
+  /// synchronously (a database that keeps every value in memory) is read
+  /// without an await per document.
+  Future<void> _forEachMatching(
+    bool Function(DocumentRecord record) visit,
+  ) async {
     final IndexManager? indexManager = _indexManager;
     final Stream<List<String>>? candidates =
         indexManager != null && _conditions.isNotEmpty
@@ -314,21 +330,25 @@ class QueryBuilder {
         : null;
     if (candidates != null) {
       await for (final List<String> chunk in candidates) {
-        for (final DocumentRecord record in await _store.getDocuments(
-          collection,
-          chunk,
-        )) {
-          if (_matches(record.document)) yield record;
+        final List<DocumentRecord> records =
+            _store.getDocumentsNow(collection, chunk) ??
+            await _store.getDocuments(collection, chunk);
+        for (final DocumentRecord record in records) {
+          if (_matches(record.document) && !visit(record)) return;
         }
       }
-    } else {
-      await for (final DocumentRecord record in _store.scanDocuments(
-        collection,
-      )) {
-        if (_matches(record.document)) {
-          yield record;
-        }
-      }
+      return;
+    }
+    if (_store.visitDocumentsNow(
+      collection,
+      (DocumentRecord record) => !_matches(record.document) || visit(record),
+    )) {
+      return;
+    }
+    await for (final DocumentRecord record in _store.scanDocuments(
+      collection,
+    )) {
+      if (_matches(record.document) && !visit(record)) return;
     }
   }
 
@@ -343,10 +363,10 @@ class QueryBuilder {
         ? effectiveOffset + effectiveLimit
         : null;
 
-    await for (final DocumentRecord record in _matchingRecords()) {
+    await _forEachMatching((DocumentRecord record) {
       matched.add(record);
-      if (stopAt != null && matched.length >= stopAt) break;
-    }
+      return stopAt == null || matched.length < stopAt;
+    });
 
     if (_orderByField != null) {
       _sortRecords(matched);
@@ -464,7 +484,7 @@ class QueryBuilder {
         );
         if (foreignValue == null) continue;
         final String bucketKey = _joinKey(foreignValue);
-        buckets.putIfAbsent(bucketKey, () => []).add(record.document);
+        buckets.putIfAbsent(bucketKey, () => []).add(_output(record.document));
       }
       for (int i = 0; i < results.length; i++) {
         final dynamic localValue = extractFieldValue(

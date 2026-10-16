@@ -136,6 +136,19 @@ final class PipelineDocumentStore implements DocumentStore {
   /// The backing engine.
   final InMemoryStorageEngine engine;
 
+  @override
+  bool get sharesDocuments => false;
+
+  @override
+  bool visitDocumentsNow(
+    String collection,
+    bool Function(DocumentRecord record) visit,
+  ) => false;
+
+  @override
+  List<DocumentRecord>? getDocumentsNow(String collection, List<String> ids) =>
+      null;
+
   /// The index manager whose ops join every document batch.
   final IndexManager indexManager;
 

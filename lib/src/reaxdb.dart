@@ -11,6 +11,7 @@ import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 
 import 'collection.dart';
+import 'core/cache/memory_store.dart';
 import 'core/cache/multi_level_cache.dart';
 import 'core/encryption/encryption_config.dart';
 import 'core/encryption/encryption_engine.dart';
@@ -115,6 +116,7 @@ final class ReaxDB {
     required this._syncMode,
     required this._lockFile,
     required this._header,
+    required this._memory,
   });
 
   /// Instances open in this isolate, keyed by canonical directory path.
@@ -136,6 +138,9 @@ final class ReaxDB {
   final ReaxLogger _logger;
   final SyncMode _syncMode;
   final _DatabaseLock _lockFile;
+
+  /// Every user entry, decoded, when opened with `keepInMemory: true`.
+  final MemoryStore? _memory;
 
   _DatabaseHeader _header;
   bool _closed = false;
@@ -178,6 +183,14 @@ final class ReaxDB {
   /// [onUpgrade] is supplied an upgrade throws [SchemaVersionException]
   /// rather than silently reinterpreting old data.
   ///
+  /// With [keepInMemory] every value is also kept decoded in memory, like a
+  /// Hive box. Reads ([get], [getSync], [exists], [scan], [keys], queries)
+  /// are then served from memory without disk access or decoding; writes
+  /// still go to the write-ahead log first and keep the same durability.
+  /// Opening loads every entry, so it takes longer and memory use grows with
+  /// the data. Values read are copies: changing one never changes the
+  /// stored value. The record cache is not used in this mode.
+  ///
   /// Throws [DatabaseLockedException] when the same path is already open in
   /// this isolate or locked by another process.
   ///
@@ -208,6 +221,7 @@ final class ReaxDB {
     int cacheMaxMemoryBytes = 64 * 1024 * 1024,
     Duration? cacheDefaultTtl,
     int changeStreamBufferSize = ChangeStreamHub.defaultMaxBufferedEvents,
+    bool keepInMemory = false,
     LogLevel logLevel = LogLevel.warning,
     List<LogOutput>? logOutputs,
     String? loggerName,
@@ -371,9 +385,11 @@ final class ReaxDB {
         syncMode: effectiveSyncMode,
         lockFile: lockFile,
         header: header,
+        memory: keepInMemory ? MemoryStore() : null,
       );
 
       pipeline.attach(db);
+      await db._loadMemory();
       await db._indexes.loadIndexes();
       _instances[canonical] = db;
 
@@ -702,7 +718,29 @@ final class ReaxDB {
   Map<String, dynamic> get encryptionInfo => _encryption.getMetadata();
 
   /// Live cache statistics.
+  ///
+  /// The record cache is not used when the database keeps every value in
+  /// memory, so these stay at zero in that mode.
   CacheStatistics get cacheStats => _cache.stats;
+
+  /// Whether this database was opened with `keepInMemory: true`.
+  bool get keepsInMemory => _memory != null;
+
+  /// Loads every user entry into [_memory], expired ones included: the
+  /// memory store mirrors storage exactly (see [MemoryStore]).
+  Future<void> _loadMemory() async {
+    final MemoryStore? memory = _memory;
+    if (memory == null) return;
+    await for (final KeyValue pair in _guardIoStream(
+      _path,
+      _storage.scan(startKey: _userKeySpaceStart),
+    )) {
+      final StoredRecord record = RecordEnvelope.decode(
+        _toEnvelope(pair.value, pair.key),
+      );
+      memory.put(utf8.decode(pair.key), record.value, record.expiresAt);
+    }
+  }
 
   /// Live transaction statistics.
   TransactionStats get transactionStats => _transactions.stats;
@@ -795,6 +833,16 @@ final class ReaxDB {
   /// the write pipeline (emitting a delete event) before this returns.
   Future<T?> get<T>(String key) async {
     _ensureOpen();
+    if (_memory != null) {
+      _checkKey(key);
+      final MemoryEntry? entry = _memory[key];
+      if (entry == null) return null;
+      if (entry.expiresAt != null && entry.isExpiredAt(DateTime.now())) {
+        await _reclaimExpired(<String>[key]);
+        return null;
+      }
+      return _cast<T>(key, copyValue(entry.value));
+    }
     final Uint8List keyBytes = encodeKey(key);
     final DateTime now = DateTime.now();
 
@@ -842,6 +890,37 @@ final class ReaxDB {
     if (_pendingReads.containsKey(key)) _dirtyReads.add(key);
   }
 
+  /// Reads [key] synchronously, or null when absent or expired.
+  ///
+  /// Only available when the database keeps every value in memory
+  /// (`ReaxDB.open(keepInMemory: true)`); otherwise it throws
+  /// [UnsupportedApiException]. Handy in a Flutter `build` method. An
+  /// expired entry reads as absent and is reclaimed in the background.
+  T? getSync<T>(String key) {
+    _ensureOpen();
+    final MemoryStore? memory = _memory;
+    if (memory == null) {
+      throw const UnsupportedApiException(
+        'getSync needs a database opened with keepInMemory: true. Use '
+        'get, which works in both modes.',
+      );
+    }
+    _checkKey(key);
+    final MemoryEntry? entry = memory[key];
+    if (entry == null) return null;
+    if (entry.expiresAt != null && entry.isExpiredAt(DateTime.now())) {
+      unawaited(_track(() => _reclaimExpired(<String>[key])));
+      return null;
+    }
+    return _cast<T>(key, copyValue(entry.value));
+  }
+
+  /// The validation of [encodeKey], without encoding: a key's first UTF-8
+  /// byte is 0x00 exactly when its first code unit is 0.
+  static void _checkKey(String key) {
+    if (key.isEmpty || key.codeUnitAt(0) == 0) encodeKey(key);
+  }
+
   /// Reads several keys, returning null for those absent or expired.
   Future<Map<String, T?>> getBatch<T>(List<String> keys) async {
     _ensureOpen();
@@ -855,6 +934,12 @@ final class ReaxDB {
   /// Whether a live (non-expired) entry exists for [key].
   Future<bool> exists(String key) async {
     _ensureOpen();
+    final MemoryStore? memory = _memory;
+    if (memory != null) {
+      _checkKey(key);
+      final MemoryEntry? entry = memory[key];
+      return entry != null && !entry.isExpiredAt(DateTime.now());
+    }
     final Uint8List keyBytes = encodeKey(key);
     final Uint8List? stored = await _guardIo(
       _path,
@@ -891,12 +976,15 @@ final class ReaxDB {
     bool reverse = false,
   }) async* {
     _ensureOpen();
-    yield* _scanRange<T>(
-      startKey == null ? _userKeySpaceStart : encodeKey(startKey),
-      endKey == null ? null : encodeKey(endKey),
-      limit,
-      reverse,
-    );
+    final Uint8List start = startKey == null
+        ? _userKeySpaceStart
+        : encodeKey(startKey);
+    final Uint8List? end = endKey == null ? null : encodeKey(endKey);
+    if (_memory != null) {
+      yield* _memoryScan<T>(startKey, endKey, limit, reverse);
+      return;
+    }
+    yield* _scanRange<T>(start, end, limit, reverse);
   }
 
   /// Streams every entry whose key starts with [prefix].
@@ -907,6 +995,15 @@ final class ReaxDB {
   }) async* {
     _ensureOpen();
     final Uint8List start = encodeKey(prefix);
+    if (_memory != null) {
+      yield* _memoryScan<T>(
+        prefix,
+        MemoryStore.prefixUpperBound(prefix),
+        limit,
+        reverse,
+      );
+      return;
+    }
     yield* _scanRange<T>(
       start,
       IndexKeyCodec.prefixUpperBound(start),
@@ -931,6 +1028,19 @@ final class ReaxDB {
         : IndexKeyCodec.prefixUpperBound(start);
     final DateTime now = DateTime.now();
     int yielded = 0;
+    final MemoryStore? memory = _memory;
+    if (memory != null) {
+      for (final MapEntry<String, MemoryEntry> entry in memory.snapshot(
+        prefix,
+        prefix == null ? null : MemoryStore.prefixUpperBound(prefix),
+        now: now,
+        reverse: reverse,
+        limit: limit,
+      )) {
+        yield entry.key;
+      }
+      return;
+    }
     await for (final KeyValue pair in _guardIoStream(
       _path,
       _storage.scan(startKey: start, endKey: end, reverse: reverse),
@@ -961,6 +1071,28 @@ final class ReaxDB {
   static final Uint8List _userKeySpaceStart = Uint8List.fromList(const <int>[
     0x01,
   ]);
+
+  Stream<ReaxEntry<T>> _memoryScan<T>(
+    String? start,
+    String? end,
+    int? limit,
+    bool reverse,
+  ) async* {
+    // A snapshot taken when the scan starts, like a storage engine scan.
+    for (final MapEntry<String, MemoryEntry> entry in _memory!.snapshot(
+      start,
+      end,
+      now: DateTime.now(),
+      reverse: reverse,
+      limit: limit,
+    )) {
+      yield ReaxEntry<T>(
+        key: entry.key,
+        value: _cast<T>(entry.key, copyValue(entry.value.value)) as T,
+        expiresAt: entry.value.expiresAt,
+      );
+    }
+  }
 
   Stream<ReaxEntry<T>> _scanRange<T>(
     Uint8List start,
@@ -1007,31 +1139,44 @@ final class ReaxDB {
       final DateTime now = DateTime.now();
 
       // 1. Build the batch: value ops plus secondary index maintenance.
+      final MemoryStore? memory = _memory;
       for (final _Mutation mutation in mutations) {
         final Uint8List keyBytes = encodeKey(mutation.key);
         final _DocumentAddress? address = _DocumentAddress.parse(mutation.key);
         final bool indexed =
             address != null &&
             _indexes.listIndexes(address.collection).isNotEmpty;
-        final Uint8List? stored = indexed || mutation.onlyIfExpired
+        // The previous value, from memory when every value is kept there.
+        final MemoryEntry? remembered = memory?[mutation.key];
+        final Uint8List? stored =
+            memory == null && (indexed || mutation.onlyIfExpired)
             ? await _storage.get(keyBytes)
             : null;
 
         if (mutation.onlyIfExpired) {
           // TTL reclamation re-checks under the pipeline lock: a fresh value
           // written since the expired one was observed must survive.
-          if (stored == null ||
-              !RecordEnvelope.isExpired(_toEnvelope(stored, keyBytes), now)) {
-            continue;
-          }
+          final bool stillExpired = memory != null
+              ? remembered != null && remembered.isExpiredAt(now)
+              : stored != null &&
+                    RecordEnvelope.isExpired(
+                      _toEnvelope(stored, keyBytes),
+                      now,
+                    );
+          if (!stillExpired) continue;
         }
 
         if (indexed) {
+          final Object? rememberedValue = remembered?.value;
           ops.addAll(
             await _indexes.buildIndexOps(
               collection: address.collection,
               docId: address.id,
-              oldDoc: stored == null
+              oldDoc: memory != null
+                  ? (rememberedValue is Map<String, dynamic>
+                        ? rememberedValue
+                        : null)
+                  : stored == null
                   ? null
                   : _decodeStoredDocument(stored, keyBytes),
               newDoc: mutation.value is Map<String, dynamic>
@@ -1061,7 +1206,23 @@ final class ReaxDB {
       }
 
       // 4. Cache, only now that the data is durable.
+      if (memory != null) {
+        for (final _Mutation mutation in applied) {
+          if (mutation.isDelete) {
+            memory.remove(mutation.key);
+          } else {
+            // Decoded from the envelope, so memory holds exactly what a read
+            // from disk would return, and never the caller's own object.
+            memory.put(
+              mutation.key,
+              RecordEnvelope.decode(mutation.envelope!).value,
+              mutation.expiresAt,
+            );
+          }
+        }
+      }
       for (final _Mutation mutation in applied) {
+        if (memory != null) break;
         _markWritten(mutation.key);
         if (mutation.isDelete) {
           _cache.remove(mutation.key);
@@ -1267,6 +1428,7 @@ final class ReaxDB {
       final Uint8List? newBytes = op.newValue;
       if (newBytes == null) {
         _cache.remove(op.key);
+        _memory?.remove(op.key);
         events.add(
           DatabaseChangeEvent(
             type: ChangeType.delete,
@@ -1279,7 +1441,13 @@ final class ReaxDB {
       }
       final Uint8List envelope = _toEnvelope(newBytes, encodeKey(op.key));
       final StoredRecord record = RecordEnvelope.decode(envelope);
-      _cache.put(op.key, envelope, expiresAt: record.expiresAt);
+      final MemoryStore? memory = _memory;
+      if (memory != null) {
+        // A copy: the decoded value also goes to change-event listeners.
+        memory.put(op.key, copyValue(record.value), record.expiresAt);
+      } else {
+        _cache.put(op.key, envelope, expiresAt: record.expiresAt);
+      }
       events.add(
         DatabaseChangeEvent(
           type: ChangeType.put,
@@ -1671,6 +1839,7 @@ final class ReaxDB {
         await step(_indexes.close);
         await step(_storage.close);
         _cache.clear();
+        _memory?.clear();
         await step(_hub.close);
       });
     } finally {
@@ -1949,8 +2118,55 @@ final class _FacadeDocumentStore implements DocumentStore {
 
   final ReaxDB _db;
 
+  /// In memory mode documents come straight from the memory store, without
+  /// a copy per document: the query layer copies only what it returns.
+  @override
+  bool get sharesDocuments => _db._memory != null;
+
+  @override
+  bool visitDocumentsNow(
+    String collection,
+    bool Function(DocumentRecord record) visit,
+  ) {
+    final MemoryStore? memory = _db._memory;
+    if (memory == null) return false;
+    final String prefix = '$collection:';
+    memory.walk(prefix, MemoryStore.prefixUpperBound(prefix), DateTime.now(), (
+      String key,
+      MemoryEntry entry,
+    ) {
+      final Object? value = entry.value;
+      return value is! Map<String, dynamic> ||
+          visit(DocumentRecord.fromKey(key, prefix.length, value));
+    });
+    return true;
+  }
+
+  @override
+  List<DocumentRecord>? getDocumentsNow(String collection, List<String> ids) {
+    final MemoryStore? memory = _db._memory;
+    if (memory == null) return null;
+    final DateTime now = DateTime.now();
+    final List<DocumentRecord> out = <DocumentRecord>[];
+    for (final String id in ids) {
+      final MemoryEntry? entry = memory['$collection:$id'];
+      if (entry == null || entry.isExpiredAt(now)) continue;
+      final Object? value = entry.value;
+      if (value is Map<String, dynamic>) out.add(DocumentRecord(id, value));
+    }
+    return out;
+  }
+
   @override
   Stream<DocumentRecord> scanDocuments(String collection) async* {
+    final List<DocumentRecord> now = <DocumentRecord>[];
+    if (visitDocumentsNow(collection, (DocumentRecord record) {
+      now.add(record);
+      return true;
+    })) {
+      yield* Stream<DocumentRecord>.fromIterable(now);
+      return;
+    }
     await for (final ReaxEntry<Object?> entry in _db.scanPrefix<Object?>(
       '$collection:',
     )) {
@@ -1979,6 +2195,8 @@ final class _FacadeDocumentStore implements DocumentStore {
     String collection,
     List<String> ids,
   ) async {
+    final List<DocumentRecord>? now = getDocumentsNow(collection, ids);
+    if (now != null) return now;
     final List<DocumentRecord> found = <DocumentRecord>[];
     for (final String id in ids) {
       final Map<String, dynamic>? document = await getDocument(collection, id);
