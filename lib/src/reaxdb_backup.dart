@@ -564,7 +564,9 @@ Future<ReaxDB> _importArchive({
             as Map<String, dynamic>;
     schemaVersion = (meta['schemaVersion'] as int?) ?? 1;
 
-    db = await ReaxDB.open(
+    // Local even with debugOpenInBackground: the restore below writes
+    // through this instance's own pipeline.
+    db = await ReaxDB._openLocal(
       path: staging.path,
       encryption: encryption,
       syncMode: syncMode,

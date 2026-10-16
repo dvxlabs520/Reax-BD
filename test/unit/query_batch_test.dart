@@ -4,6 +4,7 @@ import 'package:reaxdb_dart/reaxdb_dart.dart';
 import 'package:reaxdb_dart/src/core/storage/io_faults.dart';
 import 'package:test/test.dart';
 
+import '../support/background.dart';
 import '../support/temp_dir.dart';
 
 void main() {
@@ -47,7 +48,7 @@ void main() {
     });
     expect(writes, 1);
     expect(await db.query('items').whereEquals('flag', true).count(), 10);
-  });
+  }, skip: skipFaultInjectionInBackground);
 
   test('delete removes every matching document in one batch', () async {
     final int writes = await countWalWrites(() async {
@@ -55,7 +56,7 @@ void main() {
     });
     expect(writes, 1);
     expect(await db.query('items').count(), 13);
-  });
+  }, skip: skipFaultInjectionInBackground);
 
   test('distinct and groupBy keep large integers apart', () async {
     const int big = 9007199254740992; // 2^53

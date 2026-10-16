@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' show Finalizable, Pointer, Void;
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:math' show Random;
 import 'dart:typed_data';
 
@@ -41,6 +42,7 @@ import 'legacy/legacy_migrator.dart';
 import 'simple_api.dart';
 
 part 'reaxdb_backup.dart';
+part 'reaxdb_background.dart';
 
 /// How [ReaxDB.open] reacts to a ReaxDB 1.x database in the target directory.
 ///
@@ -130,22 +132,40 @@ final class ReaxDB {
   /// Name of the database header file inside a database directory.
   static const String headerFileName = 'reaxdb.meta';
 
+  /// The proxy of a database whose engine runs in a background isolate
+  /// (`ReaxDB.open(background: true)`): it has no engine of its own, so the
+  /// engine fields below stay unset. See `reaxdb_background.dart`.
+  ReaxDB._background({
+    required this._path,
+    required this._hub,
+    required this._logger,
+    required this._syncMode,
+    required this._header,
+    required this._memory,
+  });
+
   final String _path;
-  final LsmStorageEngine _storage;
-  final ReaxCache _cache;
-  final TransactionManager _transactions;
-  final IndexManager _indexes;
-  final EncryptionEngine _encryption;
+  // Late: a background proxy has none of these (see [ReaxDB._background]).
+  late final LsmStorageEngine _storage;
+  late final ReaxCache _cache;
+  late final TransactionManager _transactions;
+  late final IndexManager _indexes;
+  late final EncryptionEngine _encryption;
   final ChangeStreamHub _hub;
   final ReaxLogger _logger;
   final SyncMode _syncMode;
-  final _DatabaseLock _lockFile;
+  late final _DatabaseLock _lockFile;
 
   /// Every user entry, decoded, when opened with `keepInMemory: true`.
   final MemoryStore? _memory;
 
   /// Opens this database again with the same options and [encryption].
-  final Future<ReaxDB> Function(EncryptionConfig encryption) _reopen;
+  late final Future<ReaxDB> Function(EncryptionConfig encryption) _reopen;
+
+  /// Receives the keys and plaintext envelopes (null for a delete) of every
+  /// applied mutation, in commit order, when a background engine mirrors
+  /// this database's values into the caller's isolate.
+  void Function(List<String> keys, List<Uint8List?> envelopes)? _onApplied;
 
   _DatabaseHeader _header;
   bool _closed = false;
@@ -196,6 +216,17 @@ final class ReaxDB {
   /// the data. Values read are copies: changing one never changes the
   /// stored value. The record cache is not used in this mode.
   ///
+  /// With [background] the engine (write-ahead log, LSM tree, flushes and
+  /// compactions, encryption, cache, indexes and transactions) runs in a
+  /// background isolate of its own, and this isolate only exchanges
+  /// messages with it. Long flushes and compactions then never block the
+  /// calling isolate, which matters for a Flutter UI. The API and its
+  /// behaviour are the same; each call costs a round trip between isolates
+  /// (a few microseconds). With [keepInMemory] the values are kept in THIS
+  /// isolate, so [get], [getSync], [exists], [scan] and [keys] never wait
+  /// for the engine. Callbacks ([onUpgrade], [logOutputs]) run in this
+  /// isolate. See "Background isolate" in `ADVANCED.md`.
+  ///
   /// Throws [DatabaseLockedException] when the same path is already open in
   /// this isolate or locked by another process.
   ///
@@ -227,6 +258,7 @@ final class ReaxDB {
     Duration? cacheDefaultTtl,
     int changeStreamBufferSize = ChangeStreamHub.defaultMaxBufferedEvents,
     bool keepInMemory = false,
+    bool background = false,
     LogLevel logLevel = LogLevel.warning,
     List<LogOutput>? logOutputs,
     String? loggerName,
@@ -247,155 +279,12 @@ final class ReaxDB {
       'or EncryptionConfig.aes256(key: ...). Removed in 3.0.',
     )
     String? encryptionKey,
-  }) => _guardIo(path, () async {
-    if (schemaVersion < 1) {
-      throw SchemaVersionException(
-        'schemaVersion must be at least 1 (got $schemaVersion)',
-        expectedVersion: schemaVersion,
-      );
-    }
-    final EncryptionConfig effectiveEncryption = _resolveLegacyEncryption(
-      // ignore: deprecated_member_use_from_same_package
-      config: config,
-      encryptionKey: encryptionKey,
-      encryption: encryption,
-    );
-    // ignore: deprecated_member_use_from_same_package
-    final _TuningOverrides tuning = _TuningOverrides.from(config);
-    final SyncMode effectiveSyncMode = tuning.syncMode ?? syncMode;
-    final int effectiveMemtableSizeBytes =
-        tuning.memtableSizeBytes ?? memtableSizeBytes;
-    final int effectiveCacheMaxEntries =
-        tuning.cacheMaxEntries ?? cacheMaxEntries;
-
-    final String canonical = _canonicalize(path);
-    // Checked before the first await, so a second open issued while the
-    // first is still open fails even if the first is being closed.
-    if (_instances.containsKey(canonical)) {
-      throw DatabaseLockedException(
-        'Database at "$canonical" is already open in this isolate. Close the '
-        'existing ReaxDB instance before opening it again.',
-        path: canonical,
-      );
-    }
-    // Finish (or discard) a 1.x migration a crash interrupted, before the
-    // directory is created: an interrupted swap can leave the path missing.
-    await LegacyMigration.recoverInterrupted(canonical);
-    await _recoverInterruptedRestore(canonical);
-    final Directory directory = Directory(path);
-    await directory.create(recursive: true);
-    restrictToOwner(directory.path, directory: true);
-
-    // The 1.x check runs before the lock is taken because an automatic
-    // migration opens a 2.0 database at this very path through the public
-    // API, which acquires the lock itself.
-    final MigrationReport? migrationReport = await _handleLegacyDatabase(
-      canonical: canonical,
-      mode: legacyMigration,
-      legacyEncryptionKey: legacyEncryptionKey,
-      encryption: effectiveEncryption,
-    );
-
-    final _DatabaseLock lockFile = await _DatabaseLock.acquire(canonical);
-    ReaxLogger? logger;
-    LsmStorageEngine? storage;
-    try {
-      logger = ReaxLogger(
-        level: logLevel,
-        outputs: logOutputs,
-        name: loggerName ?? p.basename(canonical),
-      );
-
-      _DatabaseHeader header = await _DatabaseHeader.load(
-        canonical,
-        effectiveEncryption,
-        schemaVersion,
-      );
-
-      // PBKDF2 runs on a background isolate: hundreds of milliseconds to
-      // seconds of key derivation must not freeze a Flutter UI.
-      final EncryptionEngine engine = await EncryptionEngine.create(
-        effectiveEncryption,
-        kdfSalt: header.kdfSalt,
-      );
-      final Uint8List? keyCheck = header.keyCheck;
-      if (keyCheck != null && !engine.verifyKeyCheck(keyCheck)) {
-        throw _wrongKey(canonical);
-      }
-
-      final ReaxLogger databaseLogger = logger;
-      storage = await LsmStorageEngine.open(
-        directory: canonical,
-        syncMode: effectiveSyncMode,
-        memtableSizeBytes: effectiveMemtableSizeBytes,
-        // A flush or compaction that fails after a write is already durable
-        // does not fail that write; it is retried and reported here.
-        onMaintenanceError: (Object error, StackTrace stack) {
-          unawaited(
-            databaseLogger.error(
-              'Background flush or compaction failed and will be retried',
-              error: error,
-              stackTrace: stack,
-            ),
-          );
-        },
-      );
-
-      if (keyCheck == null && engine.type != EncryptionType.none) {
-        // A 2.0.0 database has no key check yet: prove the key against a
-        // stored value before writing one, so a wrong key can never be
-        // recorded as the right one.
-        await for (final KeyValue pair in storage.scan(
-          startKey: _userKeySpaceStart,
-          limit: 1,
-        )) {
-          try {
-            // Decoding catches a wrong obfuscation key too: XOR has no
-            // authentication tag, but garbage is not a record envelope.
-            RecordEnvelope.decode(
-              engine.decrypt(pair.value, associatedData: pair.key),
-            );
-          } on ReaxDbException {
-            throw _wrongKey(canonical);
-          }
-        }
-        header = header.withKeyCheck(engine.createKeyCheck());
-        await header.save(canonical);
-      }
-
-      final ReaxCache cache = ReaxCache(
-        maxEntries: effectiveCacheMaxEntries,
-        maxMemoryBytes: cacheMaxMemoryBytes,
-        defaultTtl: cacheDefaultTtl,
-      );
-
-      final _FacadeCommitPipeline pipeline = _FacadeCommitPipeline();
-      final ReaxDB db = ReaxDB._(
-        path: canonical,
-        storage: storage,
-        cache: cache,
-        transactions: TransactionManager(
-          storageEngine: storage,
-          defaultIsolationLevel: defaultIsolationLevel,
-          lockTimeout: lockTimeout,
-          pipeline: pipeline,
-        ),
-        indexes: IndexManager(
-          storage: storage,
-          decodeDocument: (Uint8List key, Uint8List bytes) =>
-              _decodeDocumentWith(engine, bytes, key),
-          exclusive: pipeline.exclusive,
-        ),
-        encryption: engine,
-        hub: ChangeStreamHub(maxBufferedEvents: changeStreamBufferSize),
-        logger: logger,
-        syncMode: effectiveSyncMode,
-        lockFile: lockFile,
-        header: header,
-        memory: keepInMemory ? MemoryStore() : null,
-        reopen: (EncryptionConfig newEncryption) => ReaxDB.open(
+  }) {
+    if (background || debugOpenInBackground) {
+      return _BackgroundReaxDB.open(
+        _BackgroundOptions(
           path: path,
-          encryption: newEncryption,
+          encryption: encryption,
           syncMode: syncMode,
           memtableSizeBytes: memtableSizeBytes,
           cacheMaxEntries: cacheMaxEntries,
@@ -404,36 +293,258 @@ final class ReaxDB {
           changeStreamBufferSize: changeStreamBufferSize,
           keepInMemory: keepInMemory,
           logLevel: logLevel,
-          logOutputs: logOutputs,
           loggerName: loggerName,
           defaultIsolationLevel: defaultIsolationLevel,
           lockTimeout: lockTimeout,
           schemaVersion: schemaVersion,
-          onUpgrade: onUpgrade,
+          hasUpgrade: onUpgrade != null,
+          legacyMigration: legacyMigration,
+          legacyEncryptionKey: legacyEncryptionKey,
+          config: config,
+          encryptionKey: encryptionKey,
         ),
+        logOutputs: logOutputs,
+        onUpgrade: onUpgrade,
+      );
+    }
+    return _openLocal(
+      path: path,
+      encryption: encryption,
+      syncMode: syncMode,
+      memtableSizeBytes: memtableSizeBytes,
+      cacheMaxEntries: cacheMaxEntries,
+      cacheMaxMemoryBytes: cacheMaxMemoryBytes,
+      cacheDefaultTtl: cacheDefaultTtl,
+      changeStreamBufferSize: changeStreamBufferSize,
+      keepInMemory: keepInMemory,
+      logLevel: logLevel,
+      logOutputs: logOutputs,
+      loggerName: loggerName,
+      defaultIsolationLevel: defaultIsolationLevel,
+      lockTimeout: lockTimeout,
+      schemaVersion: schemaVersion,
+      onUpgrade: onUpgrade,
+      legacyMigration: legacyMigration,
+      legacyEncryptionKey: legacyEncryptionKey,
+      // ignore: deprecated_member_use_from_same_package
+      config: config,
+      // ignore: deprecated_member_use_from_same_package
+      encryptionKey: encryptionKey,
+    );
+  }
+
+  /// [open] with the engine in this isolate.
+  static Future<ReaxDB> _openLocal({
+    required String path,
+    EncryptionConfig encryption = const EncryptionConfig.none(),
+    SyncMode syncMode = SyncMode.full,
+    int memtableSizeBytes = 4 * 1024 * 1024,
+    int cacheMaxEntries = 10000,
+    int cacheMaxMemoryBytes = 64 * 1024 * 1024,
+    Duration? cacheDefaultTtl,
+    int changeStreamBufferSize = ChangeStreamHub.defaultMaxBufferedEvents,
+    bool keepInMemory = false,
+    LogLevel logLevel = LogLevel.warning,
+    List<LogOutput>? logOutputs,
+    String? loggerName,
+    IsolationLevel defaultIsolationLevel = IsolationLevel.readCommitted,
+    Duration lockTimeout = const Duration(seconds: 10),
+    int schemaVersion = 1,
+    FutureOr<void> Function(int from, int to, ReaxDB db)? onUpgrade,
+    LegacyMigrationMode legacyMigration = LegacyMigrationMode.detect,
+    String? legacyEncryptionKey,
+    // ignore: deprecated_member_use_from_same_package
+    DatabaseConfig? config,
+    String? encryptionKey,
+  }) {
+    return _guardIo(path, () async {
+      if (schemaVersion < 1) {
+        throw SchemaVersionException(
+          'schemaVersion must be at least 1 (got $schemaVersion)',
+          expectedVersion: schemaVersion,
+        );
+      }
+      final EncryptionConfig effectiveEncryption = _resolveLegacyEncryption(
+        // ignore: deprecated_member_use_from_same_package
+        config: config,
+        encryptionKey: encryptionKey,
+        encryption: encryption,
+      );
+      // ignore: deprecated_member_use_from_same_package
+      final _TuningOverrides tuning = _TuningOverrides.from(config);
+      final SyncMode effectiveSyncMode = tuning.syncMode ?? syncMode;
+      final int effectiveMemtableSizeBytes =
+          tuning.memtableSizeBytes ?? memtableSizeBytes;
+      final int effectiveCacheMaxEntries =
+          tuning.cacheMaxEntries ?? cacheMaxEntries;
+
+      final String canonical = _canonicalize(path);
+      // Checked before the first await, so a second open issued while the
+      // first is still open fails even if the first is being closed.
+      if (_instances.containsKey(canonical)) {
+        throw DatabaseLockedException(
+          'Database at "$canonical" is already open in this isolate. Close the '
+          'existing ReaxDB instance before opening it again.',
+          path: canonical,
+        );
+      }
+      // Finish (or discard) a 1.x migration a crash interrupted, before the
+      // directory is created: an interrupted swap can leave the path missing.
+      await LegacyMigration.recoverInterrupted(canonical);
+      await _recoverInterruptedRestore(canonical);
+      final Directory directory = Directory(path);
+      await directory.create(recursive: true);
+      restrictToOwner(directory.path, directory: true);
+
+      // The 1.x check runs before the lock is taken because an automatic
+      // migration opens a 2.0 database at this very path through the public
+      // API, which acquires the lock itself.
+      final MigrationReport? migrationReport = await _handleLegacyDatabase(
+        canonical: canonical,
+        mode: legacyMigration,
+        legacyEncryptionKey: legacyEncryptionKey,
+        encryption: effectiveEncryption,
       );
 
-      pipeline.attach(db);
-      await db._loadMemory();
-      await db._indexes.loadIndexes();
-      _instances[canonical] = db;
+      final _DatabaseLock lockFile = await _DatabaseLock.acquire(canonical);
+      ReaxLogger? logger;
+      LsmStorageEngine? storage;
+      try {
+        logger = ReaxLogger(
+          level: logLevel,
+          outputs: logOutputs,
+          name: loggerName ?? p.basename(canonical),
+        );
 
-      if (header.schemaVersion != schemaVersion) {
-        await db._runUpgrade(header.schemaVersion, schemaVersion, onUpgrade);
+        _DatabaseHeader header = await _DatabaseHeader.load(
+          canonical,
+          effectiveEncryption,
+          schemaVersion,
+        );
+
+        // PBKDF2 runs on a background isolate: hundreds of milliseconds to
+        // seconds of key derivation must not freeze a Flutter UI.
+        final EncryptionEngine engine = await EncryptionEngine.create(
+          effectiveEncryption,
+          kdfSalt: header.kdfSalt,
+        );
+        final Uint8List? keyCheck = header.keyCheck;
+        if (keyCheck != null && !engine.verifyKeyCheck(keyCheck)) {
+          throw _wrongKey(canonical);
+        }
+
+        final ReaxLogger databaseLogger = logger;
+        storage = await LsmStorageEngine.open(
+          directory: canonical,
+          syncMode: effectiveSyncMode,
+          memtableSizeBytes: effectiveMemtableSizeBytes,
+          // A flush or compaction that fails after a write is already durable
+          // does not fail that write; it is retried and reported here.
+          onMaintenanceError: (Object error, StackTrace stack) {
+            unawaited(
+              databaseLogger.error(
+                'Background flush or compaction failed and will be retried',
+                error: error,
+                stackTrace: stack,
+              ),
+            );
+          },
+        );
+
+        if (keyCheck == null && engine.type != EncryptionType.none) {
+          // A 2.0.0 database has no key check yet: prove the key against a
+          // stored value before writing one, so a wrong key can never be
+          // recorded as the right one.
+          await for (final KeyValue pair in storage.scan(
+            startKey: _userKeySpaceStart,
+            limit: 1,
+          )) {
+            try {
+              // Decoding catches a wrong obfuscation key too: XOR has no
+              // authentication tag, but garbage is not a record envelope.
+              RecordEnvelope.decode(
+                engine.decrypt(pair.value, associatedData: pair.key),
+              );
+            } on ReaxDbException {
+              throw _wrongKey(canonical);
+            }
+          }
+          header = header.withKeyCheck(engine.createKeyCheck());
+          await header.save(canonical);
+        }
+
+        final ReaxCache cache = ReaxCache(
+          maxEntries: effectiveCacheMaxEntries,
+          maxMemoryBytes: cacheMaxMemoryBytes,
+          defaultTtl: cacheDefaultTtl,
+        );
+
+        final _FacadeCommitPipeline pipeline = _FacadeCommitPipeline();
+        final ReaxDB db = ReaxDB._(
+          path: canonical,
+          storage: storage,
+          cache: cache,
+          transactions: TransactionManager(
+            storageEngine: storage,
+            defaultIsolationLevel: defaultIsolationLevel,
+            lockTimeout: lockTimeout,
+            pipeline: pipeline,
+          ),
+          indexes: IndexManager(
+            storage: storage,
+            decodeDocument: (Uint8List key, Uint8List bytes) =>
+                _decodeDocumentWith(engine, bytes, key),
+            exclusive: pipeline.exclusive,
+          ),
+          encryption: engine,
+          hub: ChangeStreamHub(maxBufferedEvents: changeStreamBufferSize),
+          logger: logger,
+          syncMode: effectiveSyncMode,
+          lockFile: lockFile,
+          header: header,
+          memory: keepInMemory ? MemoryStore() : null,
+          reopen: (EncryptionConfig newEncryption) => _openLocal(
+            path: path,
+            encryption: newEncryption,
+            syncMode: syncMode,
+            memtableSizeBytes: memtableSizeBytes,
+            cacheMaxEntries: cacheMaxEntries,
+            cacheMaxMemoryBytes: cacheMaxMemoryBytes,
+            cacheDefaultTtl: cacheDefaultTtl,
+            changeStreamBufferSize: changeStreamBufferSize,
+            keepInMemory: keepInMemory,
+            logLevel: logLevel,
+            logOutputs: logOutputs,
+            loggerName: loggerName,
+            defaultIsolationLevel: defaultIsolationLevel,
+            lockTimeout: lockTimeout,
+            schemaVersion: schemaVersion,
+            onUpgrade: onUpgrade,
+          ),
+        );
+
+        pipeline.attach(db);
+        await db._loadMemory();
+        await db._indexes.loadIndexes();
+        _instances[canonical] = db;
+
+        if (header.schemaVersion != schemaVersion) {
+          await db._runUpgrade(header.schemaVersion, schemaVersion, onUpgrade);
+        }
+        if (migrationReport != null) {
+          await logger.info(_describeMigration(migrationReport));
+        }
+        await logger.info('Database opened at $canonical');
+        return db;
+      } catch (_) {
+        await storage?.close();
+        await logger?.close();
+        _instances.remove(canonical);
+        await lockFile.release();
+        rethrow;
       }
-      if (migrationReport != null) {
-        await logger.info(_describeMigration(migrationReport));
-      }
-      await logger.info('Database opened at $canonical');
-      return db;
-    } catch (_) {
-      await storage?.close();
-      await logger?.close();
-      _instances.remove(canonical);
-      await lockFile.release();
-      rethrow;
-    }
-  });
+    });
+  }
 
   static EncryptionException _wrongKey(String canonical) => EncryptionException(
     'Wrong encryption key or passphrase for the database at "$canonical". '
@@ -755,7 +866,11 @@ final class ReaxDB {
   /// memory store mirrors storage exactly (see [MemoryStore]).
   Future<void> _loadMemory() async {
     final MemoryStore? memory = _memory;
-    if (memory == null) return;
+    if (memory != null) await _loadMemoryInto(memory);
+  }
+
+  /// Loads every user entry into [memory]; see [_loadMemory].
+  Future<void> _loadMemoryInto(MemoryStore memory) async {
     // Oldest data first, so newer versions overwrite older ones and
     // tombstones remove what they delete: no merge, and one await per
     // table instead of one per entry.
@@ -1243,6 +1358,12 @@ final class ReaxDB {
       }
 
       // 4. Cache, only now that the data is durable.
+      _onApplied?.call(
+        <String>[for (final _Mutation mutation in applied) mutation.key],
+        <Uint8List?>[
+          for (final _Mutation mutation in applied) mutation.envelope,
+        ],
+      );
       if (memory != null) {
         for (final _Mutation mutation in applied) {
           if (mutation.isDelete) {
@@ -1461,10 +1582,14 @@ final class ReaxDB {
   void _afterTransactionCommit(CommitResult result) {
     final DateTime now = DateTime.now();
     final List<DatabaseChangeEvent> events = <DatabaseChangeEvent>[];
+    final List<String>? mirroredKeys = _onApplied == null ? null : <String>[];
+    final List<Uint8List?> mirrored = <Uint8List?>[];
     for (final AppliedOperation op in result.operations) {
       _markWritten(op.key);
+      mirroredKeys?.add(op.key);
       final Uint8List? newBytes = op.newValue;
       if (newBytes == null) {
+        if (mirroredKeys != null) mirrored.add(null);
         _cache.remove(op.key);
         _memory?.remove(op.key);
         events.add(
@@ -1478,6 +1603,7 @@ final class ReaxDB {
         continue;
       }
       final Uint8List envelope = _toEnvelope(newBytes, encodeKey(op.key));
+      if (mirroredKeys != null) mirrored.add(envelope);
       final StoredRecord record = RecordEnvelope.decode(envelope);
       final MemoryStore? memory = _memory;
       if (memory != null) {
@@ -1496,6 +1622,7 @@ final class ReaxDB {
         ),
       );
     }
+    if (mirroredKeys != null) _onApplied!(mirroredKeys, mirrored);
     for (final DatabaseChangeEvent event in events) {
       _hub.publish(event);
     }
@@ -1656,15 +1783,26 @@ final class ReaxDB {
   /// Aggregated live statistics for cache, storage and transactions.
   Map<String, dynamic> statistics() {
     _ensureOpen();
-    final CacheStatistics cache = _cache.stats;
-    final StorageStats storage = _storage.stats;
-    final TransactionStats transactions = _transactions.stats;
+    return _statisticsOf(
+      _encryption.type,
+      _cache.stats,
+      _storage.stats,
+      _transactions.stats,
+    );
+  }
+
+  Map<String, dynamic> _statisticsOf(
+    EncryptionType encryption,
+    CacheStatistics cache,
+    StorageStats storage,
+    TransactionStats transactions,
+  ) {
     return <String, dynamic>{
       'database': <String, dynamic>{
         'path': _path,
         'schemaVersion': _header.schemaVersion,
         'syncMode': _syncMode.name,
-        'encryption': _encryption.type.name,
+        'encryption': encryption.name,
       },
       'cache': <String, dynamic>{
         'entries': cache.entryCount,
@@ -1721,9 +1859,18 @@ final class ReaxDB {
   )
   Map<String, dynamic> getPerformanceStats() {
     _ensureOpen();
-    final CacheStatistics cache = _cache.stats;
-    final StorageStats storage = _storage.stats;
-    final TransactionStats transactions = _transactions.stats;
+    return _performanceStatsOf(
+      _cache.stats,
+      _storage.stats,
+      _transactions.stats,
+    );
+  }
+
+  static Map<String, dynamic> _performanceStatsOf(
+    CacheStatistics cache,
+    StorageStats storage,
+    TransactionStats transactions,
+  ) {
     return <String, dynamic>{
       'cache': <String, dynamic>{
         'hits': cache.hits,
@@ -1978,19 +2125,41 @@ final class ReaxDB {
 /// Reads observe the transaction's own pending writes; writes are buffered
 /// and applied atomically at commit.
 final class ReaxTransaction {
-  ReaxTransaction._(this._db, this._tx);
+  ReaxTransaction._(this._db, Transaction tx)
+    : _tx = tx,
+      id = tx.id,
+      isolationLevel = tx.isolationLevel,
+      _remote = null;
+
+  /// A transaction whose engine runs in a background isolate: every call is
+  /// forwarded to the transaction [handle] there.
+  ReaxTransaction._remote(
+    this._db,
+    _EngineClient client,
+    int handle,
+    this.id,
+    this.isolationLevel,
+  ) : _remote = (client, handle);
 
   final ReaxDB _db;
-  final Transaction _tx;
+  late final Transaction _tx;
+  final (_EngineClient, int)? _remote;
 
   /// Identifier of the underlying transaction.
-  int get id => _tx.id;
+  final int id;
 
   /// Isolation level this transaction runs under.
-  IsolationLevel get isolationLevel => _tx.isolationLevel;
+  final IsolationLevel isolationLevel;
 
   /// Reads [key] within the transaction, or null when absent or expired.
   Future<T?> get<T>(String key) async {
+    final (_EngineClient, int)? remote = _remote;
+    if (remote != null) {
+      return ReaxDB._cast<T>(
+        key,
+        await remote.$1.call(_opTxGet, remote.$2, key),
+      );
+    }
     final Uint8List? stored = await _tx.get(key);
     if (stored == null) return null;
     final StoredRecord record = RecordEnvelope.decode(
@@ -2007,6 +2176,17 @@ final class ReaxTransaction {
     Duration? ttl,
     DateTime? expiresAt,
   }) {
+    final (_EngineClient, int)? remote = _remote;
+    if (remote != null) {
+      ReaxDB._checkKey(key);
+      return remote.$1.call(
+        _opTxPut,
+        remote.$2,
+        key,
+        value,
+        ReaxDB._resolveExpiry(ttl, expiresAt),
+      );
+    }
     final Uint8List keyBytes = ReaxDB.encodeKey(key);
     return _tx.put(
       key,
@@ -2023,6 +2203,8 @@ final class ReaxTransaction {
   /// Buffers a deletion of [key] to apply at commit.
   Future<void> delete(String key) {
     ReaxDB.encodeKey(key);
+    final (_EngineClient, int)? remote = _remote;
+    if (remote != null) return remote.$1.call(_opTxDelete, remote.$2, key);
     return _tx.delete(key);
   }
 }

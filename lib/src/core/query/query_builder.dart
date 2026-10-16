@@ -77,6 +77,7 @@ class QueryBuilder {
     required this.collection,
     required this._store,
     this._indexManager,
+    this._runner,
   });
 
   /// The collection this query targets.
@@ -84,6 +85,10 @@ class QueryBuilder {
 
   final DocumentStore _store;
   final IndexManager? _indexManager;
+
+  /// Runs the terminal operations somewhere else instead: in the engine
+  /// isolate of a database opened with `background: true`.
+  final QueryRunner? _runner;
   final List<QueryCondition> _conditions = [];
   final List<_JoinSpec> _joins = [];
   int? _limitValue;
@@ -198,6 +203,11 @@ class QueryBuilder {
 
   /// Executes the query and returns all matching documents.
   Future<List<Map<String, dynamic>>> find() async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.find, null)
+          as List<Map<String, dynamic>>;
+    }
     final List<DocumentRecord> records = await _findRecords();
     final List<Map<String, dynamic>> results = [
       for (final DocumentRecord record in records) _output(record.document),
@@ -213,6 +223,11 @@ class QueryBuilder {
   /// Does not mutate this builder: calling [find] afterwards still returns
   /// every match.
   Future<Map<String, dynamic>?> findOne() async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.findOne, null)
+          as Map<String, dynamic>?;
+    }
     final List<DocumentRecord> records = await _findRecords(limitOverride: 1);
     if (records.isEmpty) return null;
     final List<Map<String, dynamic>> results = [
@@ -230,6 +245,10 @@ class QueryBuilder {
   /// With conditions every candidate document is loaded and checked, so the
   /// cost is that of the equivalent [find] minus the result list.
   Future<int> count() async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.count, null) as int;
+    }
     if (_conditions.isEmpty && _textSearchQuery == null) {
       int total = 0;
       await for (final String _ in _store.scanDocumentIds(collection)) {
@@ -247,6 +266,10 @@ class QueryBuilder {
 
   /// Executes the configured aggregation over the matching documents.
   Future<dynamic> executeAggregation() async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.executeAggregation, null);
+    }
     final AggregationBuilder? builder = _aggregationBuilder;
     if (builder == null) {
       throw const QueryException(
@@ -261,6 +284,11 @@ class QueryBuilder {
   /// Distinctness follows the index total order, so `1` and `1.0` are one
   /// value and equal lists/maps deduplicate structurally.
   Future<List<dynamic>> distinct(String field) async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.distinct, field)
+          as List<dynamic>;
+    }
     final List<dynamic> values = [];
     final Map<String, List<dynamic>> buckets = <String, List<dynamic>>{};
     for (final Map<String, dynamic> doc in await find()) {
@@ -287,6 +315,10 @@ class QueryBuilder {
   /// before the batch is written, so a write made in between can be
   /// overwritten; use a transaction for read-modify-write logic.
   Future<int> update(Map<String, dynamic> updates) async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.update, updates) as int;
+    }
     final List<DocumentRecord> records = await _findRecords();
     await _store.putDocuments(collection, <String, Map<String, dynamic>>{
       for (final DocumentRecord record in records)
@@ -298,6 +330,10 @@ class QueryBuilder {
   /// Deletes every matching document, in one atomic batch, and returns how
   /// many were removed.
   Future<int> delete() async {
+    final QueryRunner? runner = _runner;
+    if (runner != null) {
+      return await runner(_spec(), QueryTerminal.delete, null) as int;
+    }
     final List<DocumentRecord> records = await _findRecords();
     await _store.deleteDocuments(collection, <String>[
       for (final DocumentRecord record in records) record.id,
@@ -306,6 +342,34 @@ class QueryBuilder {
   }
 
   // --- execution ---------------------------------------------------------
+
+  /// This query's state as plain data, for a [QueryRunner].
+  QuerySpec _spec() => QuerySpec._(
+    collection: collection,
+    conditions: List<QueryCondition>.of(_conditions),
+    joins: List<_JoinSpec>.of(_joins),
+    limit: _limitValue,
+    offset: _offsetValue,
+    orderByField: _orderByField,
+    orderDescending: _orderDescending,
+    orderNullsLast: _orderNullsLast,
+    aggregation: _aggregationBuilder,
+    textSearchQuery: _textSearchQuery,
+    textSearchField: _textSearchField,
+  );
+
+  void _load(QuerySpec spec) {
+    _conditions.addAll(spec._conditions);
+    _joins.addAll(spec._joins);
+    _limitValue = spec._limit;
+    _offsetValue = spec._offset;
+    _orderByField = spec._orderByField;
+    _orderDescending = spec._orderDescending;
+    _orderNullsLast = spec._orderNullsLast;
+    _aggregationBuilder = spec._aggregation;
+    _textSearchQuery = spec._textSearchQuery;
+    _textSearchField = spec._textSearchField;
+  }
 
   /// [document] as it may be handed to a caller: a copy when the store
   /// shares its stored objects.
@@ -528,4 +592,88 @@ final class _JoinSpec {
   final String collection;
   final String localField;
   final String foreignField;
+}
+
+/// The terminal operations of a [QueryBuilder].
+enum QueryTerminal {
+  /// [QueryBuilder.find].
+  find,
+
+  /// [QueryBuilder.findOne].
+  findOne,
+
+  /// [QueryBuilder.count].
+  count,
+
+  /// [QueryBuilder.executeAggregation].
+  executeAggregation,
+
+  /// [QueryBuilder.distinct]; the argument is the field.
+  distinct,
+
+  /// [QueryBuilder.update]; the argument is the update map.
+  update,
+
+  /// [QueryBuilder.delete].
+  delete,
+}
+
+/// Runs [terminal] of the query described by [spec] somewhere else, with
+/// [argument] when the terminal takes one, and returns its result.
+typedef QueryRunner =
+    Future<Object?> Function(
+      QuerySpec spec,
+      QueryTerminal terminal,
+      Object? argument,
+    );
+
+/// The state of a [QueryBuilder] as plain data, which can be sent to
+/// another isolate. Rebuilt there with [runQuerySpec].
+final class QuerySpec {
+  QuerySpec._({
+    required this.collection,
+    required this._conditions,
+    required this._joins,
+    required this._limit,
+    required this._offset,
+    required this._orderByField,
+    required this._orderDescending,
+    required this._orderNullsLast,
+    required this._aggregation,
+    required this._textSearchQuery,
+    required this._textSearchField,
+  });
+
+  /// The collection the query targets.
+  final String collection;
+  final List<QueryCondition> _conditions;
+  final List<_JoinSpec> _joins;
+  final int? _limit;
+  final int? _offset;
+  final String? _orderByField;
+  final bool _orderDescending;
+  final bool _orderNullsLast;
+  final AggregationBuilder? _aggregation;
+  final String? _textSearchQuery;
+  final String? _textSearchField;
+}
+
+/// Loads [spec] into [query], a fresh builder over the same collection, and
+/// runs [terminal] on it.
+Future<Object?> runQuerySpec(
+  QueryBuilder query,
+  QuerySpec spec,
+  QueryTerminal terminal,
+  Object? argument,
+) {
+  query._load(spec);
+  return switch (terminal) {
+    QueryTerminal.find => query.find(),
+    QueryTerminal.findOne => query.findOne(),
+    QueryTerminal.count => query.count(),
+    QueryTerminal.executeAggregation => query.executeAggregation(),
+    QueryTerminal.distinct => query.distinct(argument! as String),
+    QueryTerminal.update => query.update(argument! as Map<String, dynamic>),
+    QueryTerminal.delete => query.delete(),
+  };
 }

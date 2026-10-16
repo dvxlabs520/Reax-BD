@@ -356,6 +356,11 @@ final class ChangeStreamHub {
   int get activePatternCount =>
       _exact.length + _byPrefix.length + _globs.length;
 
+  /// Called synchronously with every published event before any
+  /// subscription sees it. A background engine uses it to forward events to
+  /// the isolate that opened the database.
+  void Function(DatabaseChangeEvent event)? tap;
+
   /// Delivers [event] to every matching pattern subscription.
   ///
   /// Must be called only AFTER the write's durability point.
@@ -363,6 +368,7 @@ final class ChangeStreamHub {
     if (_closed) {
       throw const DatabaseClosedException('ChangeStreamHub is closed');
     }
+    tap?.call(event);
     _exact[event.key]?.add(event);
 
     if (_byPrefix.isNotEmpty) {

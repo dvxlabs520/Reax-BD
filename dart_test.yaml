@@ -7,3 +7,6 @@ tags:
     # Sustained-load stress tests: they push megabytes through the storage
     # engine, so they need more room than the default per-test timeout.
     timeout: 4x
+  background:
+    # The facade tests again, with every database opened in a background
+    # isolate (test/background_suite_test.dart).
