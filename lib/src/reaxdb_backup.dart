@@ -193,6 +193,9 @@ Future<int> _exportArchive(
   final File temporary = File(
     '$archivePath.tmp-${DateTime.now().microsecondsSinceEpoch}',
   );
+  // Owner-only before any data is written: an archive may be plaintext.
+  await temporary.create();
+  restrictToOwner(temporary.path, directory: false);
   final IOSink sink = temporary.openWrite();
   int entries = 0;
   try {

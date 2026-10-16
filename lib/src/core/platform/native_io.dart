@@ -23,6 +23,8 @@ typedef _MallocC = Pointer<Uint8> Function(IntPtr size);
 typedef _MallocDart = Pointer<Uint8> Function(int size);
 typedef _FreeC = Void Function(Pointer<Uint8> pointer);
 typedef _FreeDart = void Function(Pointer<Uint8> pointer);
+typedef _ChmodC = Int32 Function(Pointer<Uint8> path, Uint32 mode);
+typedef _ChmodDart = int Function(Pointer<Uint8> path, int mode);
 typedef _ErrnoC = Pointer<Int32> Function();
 typedef _ErrnoDart = Pointer<Int32> Function();
 
@@ -37,6 +39,7 @@ final class NativeIo {
     this._free,
     this._errno,
     this.closeFinalizer,
+    this._chmod,
   );
 
   static const int _oRdonly = 0;
@@ -52,6 +55,7 @@ final class NativeIo {
   final _MallocDart _malloc;
   final _FreeDart _free;
   final _ErrnoDart? _errno;
+  final _ChmodDart _chmod;
 
   /// Closes a file descriptor passed as the finalizer token, so a lock held
   /// by an isolate that dies without closing its database is released when
@@ -92,6 +96,7 @@ final class NativeIo {
         libc.lookupFunction<_FreeC, _FreeDart>('free'),
         errno,
         NativeFinalizer(libc.lookup<NativeFinalizerFunction>('close')),
+        libc.lookupFunction<_ChmodC, _ChmodDart>('chmod'),
       );
     } catch (_) {
       return null;
@@ -146,6 +151,21 @@ final class NativeIo {
     _close(fd);
   }
 
+  /// Sets the permission bits of [path] to [mode]. Returns false on failure.
+  bool chmod(String path, int mode) {
+    final List<int> bytes = utf8.encode(path);
+    final Pointer<Uint8> native = _malloc(bytes.length + 1);
+    if (native.address == 0) return false;
+    try {
+      final Uint8List view = native.asTypedList(bytes.length + 1);
+      view.setAll(0, bytes);
+      view[bytes.length] = 0;
+      return _chmod(native, mode) == 0;
+    } finally {
+      _free(native);
+    }
+  }
+
   /// fsyncs the directory [path], making renames, creations and deletions
   /// inside it durable. Returns false when the directory cannot be opened.
   bool syncDirectory(String path) {
@@ -173,4 +193,15 @@ final class NativeIo {
 /// journals metadata itself).
 void syncDirectory(String path) {
   NativeIo.instance?.syncDirectory(path);
+}
+
+/// Makes [path] readable and writable by its owner only: `0700` for a
+/// directory, `0600` for a file. Best effort, and a no-op on Windows, which
+/// has no POSIX permission bits.
+///
+/// Files ReaxDB creates inside a database directory get the process's
+/// default permissions, often world-readable; a `0700` database directory
+/// keeps other users out of all of them.
+void restrictToOwner(String path, {required bool directory}) {
+  NativeIo.instance?.chmod(path, directory ? 0x1C0 : 0x180);
 }

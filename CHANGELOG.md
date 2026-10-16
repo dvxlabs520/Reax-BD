@@ -35,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `QueryBuilder.update` and `QueryBuilder.delete` write all matching
+  documents in one atomic batch, instead of one write per document: after a
+  crash either all of them changed or none did.
+- `distinct` and `groupBy` find a value's group in constant time instead of
+  comparing it with every group seen so far.
+- The database directory is made owner-only (`0700`) when opened, and
+  export archives owner-only (`0600`) before anything is written to them.
+  Files inside the directory keep the process's default permissions, but
+  other users can no longer reach them. No effect on Windows.
 - Opening with `keepInMemory: true` reads each SSTable with one I/O instead
   of streaming entry by entry: about 168 ms instead of 306 ms for 100,000
   documents.
