@@ -68,7 +68,8 @@ built AOT, against `hive_ce` 2.22.0. Both databases store the same documents
 (`{id, name, category, score, active, payload}` with a 200-byte payload).
 Every scenario ran three times on a fresh database, and the median
 repetition is reported. The ReaxDB numbers are from the 2.5.0 development
-branch, which adds `keepInMemory`.
+branch, which adds `keepInMemory` and moves LSM maintenance off the write
+path.
 
 ```bash
 dart compile exe benchmark/hive_comparison.dart -o hive_comparison
@@ -84,45 +85,47 @@ returns before the data is flushed. "ReaxDB memory" is a database opened with
 
 | Scenario | ReaxDB | ReaxDB memory | Hive |
 | --- | ---: | ---: | ---: |
-| Durable write, one at a time | 16.9k/s | 17.6k/s | 22.7k/s |
-| Write that survives an app kill (`SyncMode.os`) | 33.1k/s | | |
-| Write with no guarantee | 53.3k/s (`SyncMode.none`) | | 77.7k/s (`put`) |
-| Durable batch of 500 | 59.9k/s | | 323.7k/s |
-| Read, warm | 29.5k/s | 1.03M/s (`getSync` 1.23M/s) | 0.73M/s |
-| Read, after reopening | 31.0k/s | 1.15M/s | 0.69M/s |
-| Open | 10.9 ms | 388 ms | 263 ms |
-| Iterate every document | 0.30M/s | 1.28M/s | 16.7M/s |
-| Query, 20,000 results | 653 ms (indexed) | 29 ms (no index), 53 ms (indexed) | 5.4 ms (`values.where`) |
+| Durable write, one at a time | 19.0k/s | 19.2k/s | 23.5k/s |
+| Write that survives an app kill (`SyncMode.os`) | 51.1k/s | | |
+| Write with no flush | 144.7k/s (`SyncMode.none`) | | 67.1k/s (`put`) |
+| Durable batch of 500 | 199.5k/s | | 309.1k/s |
+| Read, warm | 44.3k/s | 0.99M/s (`getSync` 1.16M/s) | 0.78M/s |
+| Read, first after reopening | 42.9k/s | 0.61M/s | 0.77M/s |
+| Open | 10.7 ms | 316 ms | 263 ms |
+| Iterate every document once | 0.18M/s | 0.53M/s | 18.1M/s |
+| Query, 20,000 results | 449 ms (indexed) | 24 ms (no index), 74 ms (indexed) | 3.9 ms (`values.where`) |
 | Size on disk | 31.5 MB | 31.5 MB | 32.0 MB |
 
 **10,000 documents**
 
 | Scenario | ReaxDB | ReaxDB memory | Hive |
 | --- | ---: | ---: | ---: |
-| Durable write, one at a time | 23.4k/s | 22.8k/s | 23.1k/s |
-| Durable batch of 500 | 330k/s | | 396k/s |
-| Read, warm | 0.97M/s | 1.49M/s (`getSync` 1.59M/s) | 1.95M/s |
-| Read, after reopening | 40.6k/s | 1.67M/s | 1.68M/s |
-| Open | 1.8 ms | 37 ms | 19 ms |
-| Iterate every document | 0.48M/s | 1.72M/s | 23.5M/s |
-| Query, 2,000 results | 5.0 ms (indexed) | 1.2 ms (no index) | 0.23 ms |
+| Durable write, one at a time | 21.6k/s | 22.7k/s | 22.7k/s |
+| Durable batch of 500 | 336k/s | | 419k/s |
+| Read, warm | 1.07M/s | 1.33M/s (`getSync` 2.20M/s) | 2.22M/s |
+| Read, first after reopening | 44.2k/s | 0.71M/s | 1.62M/s |
+| Open | 1.7 ms | 29 ms | 20 ms |
+| Iterate every document once | 0.47M/s | 0.72M/s | 26.5M/s |
+| Query, 2,000 results | 4.7 ms (indexed) | 1.1 ms (no index) | 0.23 ms |
 
 What this shows:
 
-- **Durable writes cost about the same in both.** The fsync dominates. At
-  100,000 documents ReaxDB is about 25% slower, because flushing and
-  compacting its LSM tree runs inside the write that triggers it.
-- **Batches at scale are ReaxDB's weak spot.** At 100,000 documents a
-  durable `putBatch` runs at a fifth of Hive's `putAll` + `flush()`, for the
-  same reason. Moving that maintenance off the write path is planned for
-  2.5.0.
-- **With `keepInMemory`, point reads are close to Hive's**: 10 to 25%
-  slower at 1,000 and 10,000 documents, and about 1.5 times faster at
-  100,000, where Hive slows down more.
-  Without it, ReaxDB reads from disk and is 20 to 40 times slower.
-- **Opening is the price of keeping everything in memory**, for both: Hive
-  and ReaxDB in memory mode read and decode every document on open. Without
-  `keepInMemory`, ReaxDB opens in about 11 ms at 100,000 documents.
+- **Durable writes cost about the same in both.** The fsync dominates; at
+  100,000 documents ReaxDB is about 20% slower.
+- **Writes that skip the flush are faster in ReaxDB**: 144.7k/s with
+  `SyncMode.none` against 67.1k/s for Hive's `put` at 100,000 documents.
+  `SyncMode.os`, which also survives an app kill, runs at 51.1k/s.
+- **Batches are within a factor of 1.5.** Before 2.5.0 a durable
+  `putBatch` at 100,000 documents ran at 59.9k/s, a fifth of Hive's; moving
+  flushes and compaction off the write path and a constant-time record cache
+  brought it to 199.5k/s.
+- **With `keepInMemory`, point reads are close to Hive's or faster**: about
+  1.3 times faster at 100,000 documents, the same with `getSync` at 10,000.
+  The first read of each value after opening decodes it, so it is slower
+  than Hive, which decodes everything while opening. Without `keepInMemory`,
+  ReaxDB reads from disk.
+- **Opening in memory mode takes about as long as Hive**, a little longer at
+  100,000 documents. Without `keepInMemory`, ReaxDB opens in about 11 ms.
 - **Iteration and queries are still clearly faster in Hive.** Hive hands
   out the objects it stores; ReaxDB returns copies, so changing a result
   never changes the database, and its scans are streams. A query that
@@ -297,14 +300,29 @@ repetition; tail percentiles are `n/a` where `n < 20`.
 
 ## Reading the tails
 
-The `max` column is where the compaction work shows up. Individual writes are
-tens of microseconds at p99, but the slowest single `put` in the
-100,000-document run took 346 ms (`SyncMode.full`) and 350 ms
-(`SyncMode.none`), and the slowest 500-document batch took 361 ms. Those are
-the calls that happened to trigger a memtable flush plus a multi-level
-compaction, which ReaxDB currently performs **inline, on the calling
-operation**. If your application cares about worst-case write latency rather
-than throughput, that is the number that matters.
+The `max` column is where maintenance work shows up. In 2.1.0 the slowest
+single `put` in the 100,000-document run took 346 ms (`SyncMode.full`) and
+350 ms (`SyncMode.none`), and the slowest 500-document batch took 361 ms:
+those calls flushed the memtable and ran a multi-level compaction inline.
+
+Since 2.5.0 flushing and compaction run in the background, after the write
+that triggered them, and the default level sizes rewrite data about half as
+often. Measured the same way on the 2.5.0 development branch, at 100,000
+documents:
+
+| scenario | sync | p99 | max | ops/sec |
+| --- | --- | ---: | ---: | ---: |
+| sequential_write | full | 99 us | 18.63 ms | 19,580 |
+| sequential_write | none | 12 us | 19.17 ms | 146,835 |
+| random_write | full | 96 us | 19.52 ms | 19,007 |
+| random_write | none | 13 us | 18.19 ms | 128,510 |
+| batch_write (500) | full | 19.72 ms | 20.72 ms | 204,562 |
+| batch_write (500) | none | 20.54 ms | 23.11 ms | 204,248 |
+
+The worst write is now about 20 ms instead of about 350 ms. The p99 of a
+single write rose from about 60 us to about 100 us, because the background
+work shares the isolate with the writes; the total is lower. Writes slow
+down only if two sealed memtables are already waiting for their flush.
 
 Startup behaves the same way. Opening a cleanly closed 100,000-document
 database takes 11.09 ms, because the WAL was checkpointed during `close()` and

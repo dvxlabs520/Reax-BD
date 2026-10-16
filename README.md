@@ -86,10 +86,11 @@ smaller sizes in [BENCHMARKS.md](BENCHMARKS.md#reaxdb-and-hive)):
 
 | | ReaxDB | ReaxDB, `keepInMemory` | Hive |
 | --- | ---: | ---: | ---: |
-| Durable write | 16.9k/s | 17.6k/s | 22.7k/s (`put` + `flush`) |
-| Read | 29.5k/s | 1.03M/s | 0.73M/s |
-| Open | 11 ms | 388 ms | 263 ms |
-| Query, 20,000 results | 653 ms | 29 ms | 5.4 ms (`values.where`) |
+| Durable write | 19.0k/s | 19.2k/s | 23.5k/s (`put` + `flush`) |
+| Batch of 500 | 199.5k/s | | 309.1k/s |
+| Read | 44.3k/s | 0.99M/s | 0.78M/s |
+| Open | 11 ms | 316 ms | 263 ms |
+| Query, 20,000 results | 449 ms | 24 ms | 3.9 ms (`values.where`) |
 
 Choose Hive if you need the web, or the fastest possible iteration over
 everything you store. Choose ReaxDB if losing a write is not acceptable, or

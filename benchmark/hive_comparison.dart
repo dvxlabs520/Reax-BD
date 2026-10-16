@@ -6,6 +6,8 @@
 //   dart compile exe benchmark/hive_comparison.dart -o hive_comparison
 //   ./hive_comparison --sizes=1000,10000,100000 --runs=3
 //
+// --only=<text> runs just the scenarios whose name contains <text>.
+//
 // Every operation is timed on its own. The first 10% of samples of each
 // repetition are discarded as warmup, each scenario runs --runs times on a
 // fresh database, and the median repetition (by throughput) is reported.
@@ -30,6 +32,8 @@ Future<void> main(List<String> args) async {
       .map(int.parse)
       .toList();
   final int runs = int.parse(options['runs'] ?? '3');
+  // Runs only the scenarios whose name contains this text.
+  final String? only = options['only'];
   final Directory work = await Directory(
     options['work-dir'] ?? Directory.systemTemp.path,
   ).createTemp('reax_vs_hive_');
@@ -63,6 +67,7 @@ Future<void> main(List<String> args) async {
         '${'p50 us'.padLeft(10)}${'p99 us'.padLeft(10)}  note',
       );
       for (final _Scenario scenario in _scenarios) {
+        if (only != null && !scenario.name.contains(only)) continue;
         final List<_Result> reps = <_Result>[];
         for (int r = 0; r < runs; r++) {
           final Directory dir = await work.createTemp('run_');
@@ -328,6 +333,9 @@ final List<_Scenario> _scenarios = <_Scenario>[
   _Scenario('read, warm       ReaxDB memory get', (p, n, rep) async {
     final ReaxDB db = await _reax(p, memory: true);
     await _fillReax(db, n);
+    for (final int i in _shuffled(n, rep)) {
+      await db.get<Map<String, dynamic>>(_key(i));
+    }
     final List<int> order = _shuffled(n, rep + 100);
     final _Recorder r = _Recorder(0);
     await r.timeLoop(() async {
@@ -340,6 +348,9 @@ final List<_Scenario> _scenarios = <_Scenario>[
   _Scenario('read, warm       ReaxDB memory getSync', (p, n, rep) async {
     final ReaxDB db = await _reax(p, memory: true);
     await _fillReax(db, n);
+    for (final int i in _shuffled(n, rep)) {
+      await db.get<Map<String, dynamic>>(_key(i));
+    }
     final List<int> order = _shuffled(n, rep + 100);
     final _Recorder r = _Recorder(0);
     await r.timeLoop(() async {

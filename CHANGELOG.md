@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `ReaxDB.open(keepInMemory: true)` keeps every value decoded in memory,
-  like a Hive box. `get`, `exists`, `scan`, `scanPrefix`, `keys`, `range`
+- `ReaxDB.open(keepInMemory: true)` keeps every value in memory, like a
+  Hive box, decoded the first time it is read. `get`, `exists`, `scan`, `scanPrefix`, `keys`, `range`
   and queries are served from memory, without disk access or decoding.
   Writes still go to the write-ahead log first, with the same durability.
   Values read are copies, so changing one never changes the stored value.
@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Flushing a full memtable and compacting the LSM tree now happen in the
+  background, after the write that triggered them has returned, instead of
+  inside it. The WAL is checkpointed only after the new SSTable and its
+  manifest are durable, so crash safety is unchanged.
+- Writes can now fail with `StorageException` when flushing keeps failing
+  (for example on a full disk) and two sealed memtables already wait for
+  it. Before, the memtable grew without bound in that situation. Writes
+  resume once a flush succeeds. Code that switches exhaustively over
+  `ReaxDbException` needs no change.
+- New LSM defaults: compaction starts at eight L0 tables instead of four,
+  and L1 holds 64 MiB instead of 8 MiB. A 100,000-document bulk load
+  rewrites its data about half as often.
+- The record cache does every operation in constant time. A `put` that had
+  to evict cost about 4 microseconds and now costs well under one, which
+  roughly halves the cost of `putBatch`.
 - Queries no longer await once per document. Each matching document now
   costs a plain loop iteration when the documents are in memory, and one
   await per chunk on the index path.
