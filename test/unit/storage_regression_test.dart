@@ -290,8 +290,11 @@ void main() {
         syncMode: SyncMode.none,
       );
       final value = Uint8List(200);
+      // Each round rewrites the same 1,000 keys: enough flushes and
+      // compactions to leave obsolete tables behind if they leaked, and
+      // light enough for the Windows runner.
       for (var round = 0; round < 4; round++) {
-        for (var i = 0; i < 5000; i++) {
+        for (var i = 0; i < 2000; i++) {
           await e.put(_b('k${i % 1000}'), value);
         }
       }

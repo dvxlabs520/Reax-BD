@@ -382,9 +382,12 @@ void main() {
     Future<ReaxDB> seeded(String name) async {
       final ReaxDB db = await open(name);
       await db.createIndex('u', <String>['city']);
-      for (int i = 0; i < 1200; i++) {
-        await db.put('u:$i', <String, dynamic>{'city': i.isEven ? 'A' : 'B'});
-      }
+      // One durable batch: 1,200 single fsynced writes take most of the
+      // timeout on the Windows runner, and these tests are about archives.
+      await db.putBatch(<String, Object?>{
+        for (int i = 0; i < 1200; i++)
+          'u:$i': <String, dynamic>{'city': i.isEven ? 'A' : 'B'},
+      });
       await db.put('ttl', 'x', ttl: const Duration(days: 1));
       return db;
     }
