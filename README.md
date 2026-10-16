@@ -70,6 +70,14 @@ final support = await getApplicationSupportDirectory();
 final db = await ReaxDB.open(path: p.join(support.path, 'myapp'));
 ```
 
+Or use [`reaxdb_flutter`](https://pub.dev/packages/reaxdb_flutter), which
+picks that folder for you, keeps the encryption key in the Keychain or
+Keystore, and turns queries into streams for `StreamBuilder`:
+
+```dart
+final db = await ReaxFlutter.open('myapp', encrypted: true);
+```
+
 Or the small API, which covers plain key/value use. It takes the same
 absolute `path:`:
 
